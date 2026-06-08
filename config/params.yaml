@@ -1,0 +1,27 @@
+version: 1
+params_hash: sha256:1d504df889ac7523
+E_base: 0.6
+k0: 0.2
+E_min: 0.4
+E_max: 0.8
+lambda_:
+  US: 0.6
+  DM: 0.6
+  CN: 0.3
+  HK: 0.3
+band_pp: 0.15
+delta_home: 0.03
+cape_target_window: 120
+delta_quadrant: 0.08
+defensive_single_asset_cap: 0.45
+ewma_fast_halflife: 6
+ewma_slow_halflife: 36
+ewma_mix_weight: 0.7
+H: 10
+tau: 0.5
+n_min: 24
+breadth_min: 20
+kelly_fraction: 0.25
+active_name_cap: 0.1
+band_rel: 0.25
+band_abs: 0.05

@@ -1,0 +1,96 @@
+# 回测配置 — 非策略参数
+start_date: "1995-01-31"
+end_date: "2024-12-31"
+base_currency: CNY
+monthly_contribution_cny: 10000  # 模拟月度定投金额
+
+# 成本模型
+costs:
+  equity_bps: 10             # 股票 ETF 单边交易成本 (bps)
+  defensive_bps: 5           # 防御资产交易成本
+  fx_spread_bps: 20          # 换汇点差 (半边)
+  tax_dividend_withholding:  # 股息预扣税 (中美税收协定 10%)
+    US: 0.10
+    DM: 0.15
+    CN: 0.00
+    HK: 0.00
+
+# 市场定义 — 股票腿
+equity_markets:
+  US:
+    etf: SPY           # yfinance 有最长历史
+    currency: USD
+    cap_weight: 0.50   # 市值权重先验 (近似 MSCI)
+  DM:
+    etf: EFA           # iShares MSCI EAFE
+    currency: USD
+    cap_weight: 0.20
+  CN:
+    etf: "510300"      # 沪深300 ETF (上交所)
+    currency: CNY
+    cap_weight: 0.20
+  HK:
+    etf: "2800.HK"     # 盈富基金
+    currency: HKD
+    cap_weight: 0.10
+
+# 防御资产
+defensive_assets:
+  CN_GOVT:
+    etf: "511260"      # 十年国债 ETF
+    currency: CNY
+  TIPS:
+    etf: TIP           # iShares TIPS Bond
+    currency: USD
+  GOLD:
+    etf: GLD           # SPDR Gold
+    currency: USD
+  CORP_BOND:
+    etf: LQD           # iShares IG Corp Bond
+    currency: USD
+  EM_BOND:
+    etf: EMB           # iShares EM Bond
+    currency: USD
+
+# 被动基准
+benchmarks:
+  static_60_40:
+    equity_weight: 0.60
+    defensive_weight: 0.40
+    equity_sleeve: { US: 0.50, DM: 0.20, CN: 0.20, HK: 0.10 }
+    defensive_sleeve: { CN_GOVT: 0.30, TIPS: 0.25, GOLD: 0.20, CORP_BOND: 0.15, EM_BOND: 0.10 }
+  equal_weight:
+    # 9 个腿 (4 equity + 5 defensive) 各 1/9
+    weights:
+      US: 0.1111
+      DM: 0.1111
+      CN: 0.1111
+      HK: 0.1111
+      CN_GOVT: 0.1111
+      TIPS: 0.1111
+      GOLD: 0.1111
+      CORP_BOND: 0.1111
+      EM_BOND: 0.1111
+
+# 象限分类器 (用已实现数据 + 发布滞后)
+quadrant:
+  growth_indicator: "industrial_production_yoy"
+  inflation_indicator: "cpi_yoy"
+  growth_threshold: 0.025   # 增长 > 2.5% = 高增长
+  inflation_threshold: 0.025
+  lag_months: 3             # 发布滞后 3 个月
+
+# Regime 分析窗口
+regimes:
+  dot_com:
+    start: "2000-01-31"
+    end: "2002-10-31"
+    label: "2000 科技泡沫"
+  gfc:
+    start: "2007-10-31"
+    end: "2009-03-31"
+    label: "2008 金融危机"
+  rate_shock:
+    start: "2022-01-31"
+    end: "2022-10-31"
+    label: "2022 利率冲击"
