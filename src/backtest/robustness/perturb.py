@@ -18,7 +18,7 @@ class PerturbationSpec:
     perturbations: list[float]  # 绝对值列表
 
 
-# 默认扰动规格
+# 默认扰动规格 (旧架构, 保留向后兼容)
 DEFAULT_SPECS = [
     PerturbationSpec("E_base", 0.60, [0.50, 0.55, 0.60, 0.65, 0.70]),
     PerturbationSpec("k0", 0.20, [0.10, 0.15, 0.20, 0.25, 0.30]),
@@ -26,6 +26,15 @@ DEFAULT_SPECS = [
     PerturbationSpec("delta_quadrant", 0.08, [0.04, 0.06, 0.08, 0.10, 0.12]),
     PerturbationSpec("defensive_single_asset_cap", 0.45, [0.35, 0.40, 0.45, 0.50, 0.55]),
     PerturbationSpec("delta_home", 0.03, [0.00, 0.02, 0.03, 0.04, 0.05]),
+]
+
+# 新架构扰动规格 (ALLOCATOR_PLAN)
+DEFAULT_SPECS_V2 = [
+    PerturbationSpec("attack_defense_ratio", 0.50, [0.30, 0.40, 0.50, 0.60, 0.70]),
+    PerturbationSpec("w_val", 0.50, [0.30, 0.40, 0.50, 0.60, 0.70]),
+    PerturbationSpec("w_mom", 0.50, [0.30, 0.40, 0.50, 0.60, 0.70]),
+    PerturbationSpec("tilt_max", 0.10, [0.05, 0.08, 0.10, 0.12, 0.15]),
+    PerturbationSpec("tilt_band_pp", 0.05, [0.03, 0.04, 0.05, 0.06, 0.08]),
 ]
 
 

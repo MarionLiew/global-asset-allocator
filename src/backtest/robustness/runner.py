@@ -7,6 +7,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+import numpy as np
 import pandas as pd
 
 from ..config import Params, BacktestConfig
@@ -84,7 +85,3 @@ def run_robustness(
             logger.warning(f"  扰动 {param_name}={value} 失败: {e}")
 
     return results
-
-
-# 需要 numpy
-import numpy as np

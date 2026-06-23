@@ -11,6 +11,22 @@ DEFENSIVE_ASSETS = ["CN_GOVT", "TIPS", "GOLD", "CORP_BOND", "EM_BOND"]
 # 所有腿 (equity + defensive)
 ALL_LEGS = [f"{m}_equity" for m in EQUITY_MARKETS] + DEFENSIVE_ASSETS
 
+# ── 分组树（按风险来源分组，见 ALLOCATOR_PLAN.md §二） ──────────────────────
+GROUP_TREE = {
+    "attack": {
+        "equity":  ["US", "DM", "CN", "HK"],
+        "crypto":  [],   # 本轮留空，2015 子样本单独评估
+    },
+    "defense": {
+        "rates":       ["CN_GOVT", "TIPS"],
+        "real_credit": ["GOLD", "CORP_BOND", "EM_BOND"],
+    },
+}
+
+# ── 动量参数 ─────────────────────────────────────────────────────────────────
+MOMENTUM_LOOKBACK = 12   # 回看窗口（月）
+MOMENTUM_SKIP = 1        # 跳过最近 N 个月（避免短期反转）
+
 # 市场 → 货币
 MARKET_CURRENCY = {
     "US": "USD",

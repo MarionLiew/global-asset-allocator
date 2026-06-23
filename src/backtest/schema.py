@@ -14,11 +14,15 @@ import pandas as pd
 class WeightSnapshot:
     """某月的目标权重快照。"""
     asof: date
-    E: float                                    # Layer 0: 总股票预算
-    m_i: dict[str, float]                       # Layer 1: 跨市场权重
-    d_j: dict[str, float]                       # Layer 2: 防御构成
+    E: float                                    # 旧 Layer 0: 总股票预算 (兼容)
+    m_i: dict[str, float]                       # 旧 Layer 1: 跨市场权重 (兼容)
+    d_j: dict[str, float]                       # 旧 Layer 2: 防御构成 (兼容)
     targets: dict[str, float]                   # 合成: equity legs = E*m_i, defensive = (1-E)*d_j
     params_hash: str = ""
+    # 新: 锚层输出
+    risk_weights: dict[str, float] = field(default_factory=dict)   # handcrafting 风险权重
+    cash_weights: dict[str, float] = field(default_factory=dict)   # 逆波动率现金权重
+    tilt_weights: dict[str, float] = field(default_factory=dict)   # 倾斜后最终权重
 
 
 @dataclass
@@ -39,12 +43,15 @@ class ExecutionRecord:
 class AttributionRecord:
     """逐层归因记录。"""
     asof: date
-    E_timing: float             # Layer 0 择时贡献
-    regional_tilt: float        # Layer 1 地区倾斜贡献
-    defensive_comp: float       # Layer 2 防御构成贡献
+    E_timing: float             # 旧 Layer 0 择时贡献 (兼容)
+    regional_tilt: float        # 旧 Layer 1 地区倾斜贡献 (兼容)
+    defensive_comp: float       # 旧 Layer 2 防御构成贡献 (兼容)
     style: float = 0.0          # Layer 3 (stub)
     residual: float = 0.0
     total: float = 0.0
+    # 新: 锚 vs 倾斜归因
+    anchor_return: float = 0.0           # 锚层回报
+    tilt_incremental: float = 0.0        # 倾斜相对锚的增量 (核心验证目标)
 
 
 @dataclass

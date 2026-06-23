@@ -66,6 +66,14 @@ class MarketDataProvider(Protocol):
         """象限分类: "GG" / "GI" / "IG" / "II"。"""
         ...
 
+    def momentum(self, market: str, asof: date) -> float:
+        """某市场在 asof 时的标准化动量分数 (横截面 z-score，clip 到 [-1, +1])。
+
+        经典 12-1 动量: 回看 12 个月，跳过最近 1 个月。
+        跨市场截面标准化后返回。
+        """
+        ...
+
     def fx_rate(self, currency: str, asof: date) -> float:
         """币种对 CNY 的汇率。CNY 自身为 1.0。"""
         ...

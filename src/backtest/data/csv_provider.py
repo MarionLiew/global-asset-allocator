@@ -15,7 +15,9 @@ import pandas as pd
 
 from ..config import Params
 from ..engine.ewma import mixed_ewma_vol
-from ._constants import EQUITY_MARKETS, DEFENSIVE_ASSETS
+from ._constants import (
+    EQUITY_MARKETS, DEFENSIVE_ASSETS, MOMENTUM_LOOKBACK, MOMENTUM_SKIP,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -85,6 +87,10 @@ class CSVProvider:
                 vols = self._compute_ewma_series(rets)
                 self._vol_cache[asset_id] = vols
 
+        # 预计算动量分数 (横截面 z-score)
+        self._momentum_df: pd.DataFrame | None = None
+        self._load_momentum()
+
     def _compute_ewma_series(self, rets: pd.Series) -> pd.Series:
         """预计算混合 EWMA 波动率序列 (年化)。"""
         p = self.params
@@ -101,6 +107,46 @@ class CSVProvider:
         """PIT: 只返回 asof 之前 (含) 的数据。"""
         asof_ts = pd.Timestamp(asof)
         return df[df[date_col] <= asof_ts]
+
+    def _load_momentum(self):
+        """预计算动量分数: 经典 12-1 动量，跨市场截面 z-score。"""
+        if self._etf_returns.empty:
+            return
+
+        # pivot 成 (date, market) 回报矩阵
+        equity = self._etf_returns[
+            self._etf_returns["asset_id"].isin(EQUITY_MARKETS)
+        ].copy()
+        if equity.empty:
+            return
+
+        ret_matrix = equity.pivot_table(
+            index="date", columns="asset_id", values="return_m"
+        ).sort_index()
+
+        # 12-1 动量: 累积回报 [t-12, t-2]（跳过最近 1 个月）
+        lookback = MOMENTUM_LOOKBACK
+        skip = MOMENTUM_SKIP
+        mom_raw = pd.DataFrame(index=ret_matrix.index, columns=ret_matrix.columns, dtype=float)
+        for mkt in ret_matrix.columns:
+            col = ret_matrix[mkt]
+            # 用 (1+r).rolling().apply(product) 或 shift+rolling
+            log_ret = np.log(1 + col)
+            cum = log_ret.rolling(window=lookback, min_periods=lookback).sum()
+            cum_skip = log_ret.rolling(window=lookback - skip, min_periods=lookback - skip).sum().shift(skip)
+            mom_raw[mkt] = cum_skip  # 已跳过最近 skip 个月
+
+        # 横截面 z-score（每月跨市场标准化）
+        mom_mean = mom_raw.mean(axis=1)
+        mom_std = mom_raw.std(axis=1).replace(0, np.nan)
+        mom_z = mom_raw.sub(mom_mean, axis=1).div(mom_std, axis=1)
+        mom_z = mom_z.clip(-1, 1)  # clip 到 [-1, +1]
+
+        # 转成长格式
+        mom_long = mom_z.stack().reset_index()
+        mom_long.columns = ["date", "market", "momentum"]
+        mom_long = mom_long.dropna(subset=["momentum"])
+        self._momentum_df = mom_long
 
     def _latest(self, df: pd.DataFrame, asof: date, date_col: str = "date"):
         """取 asof 之前最新一行。"""
@@ -263,6 +309,18 @@ class CSVProvider:
             defaults = {"USD": 7.2, "HKD": 0.92}
             return defaults.get(currency, 1.0)
         return float(subset.iloc[-1]["rate_to_cny"])
+
+    def momentum(self, market: str, asof: date) -> float:
+        """标准化动量分数 (横截面 z-score, clip [-1, +1])。"""
+        if self._momentum_df is None or self._momentum_df.empty:
+            return 0.0
+        subset = self._momentum_df[
+            (self._momentum_df["market"] == market) &
+            (self._momentum_df["date"] <= pd.Timestamp(asof))
+        ]
+        if subset.empty:
+            return 0.0
+        return float(subset.iloc[-1]["momentum"])
 
     def get_available_dates(self) -> list[pd.Timestamp]:
         """获取所有可用的月末日期。"""

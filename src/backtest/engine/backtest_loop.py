@@ -1,15 +1,8 @@
 """
 主回测循环 — 逐月从 start_date 到 end_date。
 
-每月步骤:
-1. mark-to-market (已实现回报更新)
-2. Layer 0: compute_equity_budget
-3. Layer 1: compute_regional_weights
-4. Layer 2: compute_defensive_weights
-5. 合成目标权重: equity legs = E * m_i, defensive legs = (1-E) * d_j
-6. 执行: monthly_execute
-7. 记录: weights, attribution, costs
-8. 推进到下个月
+旧逻辑 (run_backtest): Layer 0/1/2 三层。
+新逻辑 (run_backtest_v2): 锚层 → 倾斜层 → 执行层 (ALLOCATOR_PLAN)。
 """
 
 from __future__ import annotations
@@ -23,9 +16,11 @@ import pandas as pd
 from ..config import BacktestConfig, Params
 from ..schema import BacktestResult, WeightSnapshot, AttributionRecord, ExecutionRecord
 from .layer0 import compute_equity_budget
-from .layer1 import compute_regional_weights
+from .layer1 import compute_regional_weights, compute_tilt
 from .layer2 import compute_defensive_weights
-from .execution import Portfolio, monthly_execute
+from .anchor import compute_anchor_risk_weights
+from .risk_to_cash import risk_weights_to_cash_weights
+from .execution import Portfolio, monthly_execute, monthly_execute_ntz
 from ..data._constants import EQUITY_MARKETS, DEFENSIVE_ASSETS, MARKET_CURRENCY
 
 if TYPE_CHECKING:
@@ -249,4 +244,200 @@ def _compute_attribution(
         style=0.0,
         residual=residual,
         total=r_total,
+    )
+
+
+# ── 新: v2 回测循环 (ALLOCATOR_PLAN) ──────────────────────────────────────────
+
+
+def run_backtest_v2(
+    params: Params,
+    bt_cfg: BacktestConfig,
+    md: "MarketDataProvider",
+) -> BacktestResult:
+    """v2 回测循环: 锚层 → 倾斜层 → NTZ 执行层。
+
+    每月步骤:
+    1. mark-to-market
+    2. 锚层: compute_anchor_risk_weights → 风险权重
+    3. 风险→现金: risk_weights_to_cash_weights
+    4. 倾斜层: compute_tilt (仅影响股票子组内部)
+    5. 执行: monthly_execute_ntz (不交易区 + 新钱填补)
+    6. 记录: weights, attribution, costs
+    """
+    # 获取所有可用月末日期
+    available = md.get_available_dates()
+    start = pd.Timestamp(bt_cfg.start_date)
+    end = pd.Timestamp(bt_cfg.end_date)
+    dates = [d for d in available if start <= d <= end]
+
+    if not dates:
+        raise ValueError(f"无可用日期在 {bt_cfg.start_date} ~ {bt_cfg.end_date}")
+
+    logger.info(f"v2 回测: {dates[0].date()} → {dates[-1].date()}, 共 {len(dates)} 月")
+
+    # 初始化
+    portfolio = Portfolio()
+    contribution = bt_cfg.monthly_contribution_cny
+
+    # 所有腿 ID
+    all_legs = [f"{m}_equity" for m in EQUITY_MARKETS] + DEFENSIVE_ASSETS
+
+    # 结果收集
+    nav_series = {}
+    weight_history = []
+    executions = []
+    attributions = []
+    cumulative_return = 1.0
+    twr_series = {}
+    prev_nav_after_exec = 0.0
+
+    # 基准
+    from ..benchmarks.static_60_40 import StaticSixtyForty
+    from ..benchmarks.equal_weight import EqualWeight
+    from ..benchmarks.anchor_only import AnchorOnlyBenchmark
+    bench_6040 = StaticSixtyForty(bt_cfg, all_legs)
+    bench_ew = EqualWeight(bt_cfg, all_legs)
+    bench_anchor = AnchorOnlyBenchmark(bt_cfg, all_legs)
+
+    # 主循环
+    for i, dt in enumerate(dates):
+        asof = dt.date() if hasattr(dt, 'date') else dt
+
+        # Step 1: mark-to-market
+        if i > 0:
+            returns_cny = {}
+            for leg in all_legs:
+                data_key = leg.replace("_equity", "")
+                ret = md.monthly_return(data_key, asof)
+                returns_cny[data_key] = ret
+
+            portfolio.mark_to_market(returns_cny)
+            bench_6040.mark_to_market(returns_cny, asof)
+            bench_ew.mark_to_market(returns_cny, asof)
+            bench_anchor.mark_to_market(returns_cny, asof)
+
+        # Step 2: 锚层 — handcrafting 风险权重
+        risk_weights = compute_anchor_risk_weights(md, params, asof)
+
+        # Step 3: 风险权重 → 现金权重 (逆波动率)
+        cash_weights = risk_weights_to_cash_weights(risk_weights, md, asof)
+
+        # Step 4: 倾斜层 (仅影响股票子组内部)
+        tilt_weights = compute_tilt(risk_weights, md, params, asof)
+
+        # 合成目标权重: 倾斜后权重即为各资产的目标权重
+        # (锚层已经处理了攻防比例, 倾斜只调整股票子组内部)
+        targets = {}
+        for asset, w in tilt_weights.items():
+            # 股票资产需要加 _equity 后缀
+            if asset in EQUITY_MARKETS:
+                targets[f"{asset}_equity"] = w
+            else:
+                targets[asset] = w
+
+        # 记录权重快照
+        snap = WeightSnapshot(
+            asof=asof,
+            E=sum(tilt_weights.get(m, 0) for m in EQUITY_MARKETS),  # 兼容字段
+            m_i={m: tilt_weights.get(m, 0) for m in EQUITY_MARKETS},  # 兼容字段
+            d_j={j: tilt_weights.get(j, 0) for j in DEFENSIVE_ASSETS},  # 兼容字段
+            targets=dict(targets),
+            params_hash=params.params_hash,
+            risk_weights=dict(risk_weights),
+            cash_weights=dict(cash_weights),
+            tilt_weights=dict(tilt_weights),
+        )
+        weight_history.append(snap)
+
+        # Step 5: 执行 (不交易区)
+        exec_rec = monthly_execute_ntz(
+            asof=asof,
+            targets=targets,
+            portfolio=portfolio,
+            md=md,
+            params=params,
+            bt_cfg=bt_cfg,
+            contribution_cny=contribution,
+        )
+        executions.append(exec_rec)
+
+        # 锚基准执行
+        anchor_targets = {}
+        for asset, w in risk_weights.items():
+            if asset in EQUITY_MARKETS:
+                anchor_targets[f"{asset}_equity"] = w
+            else:
+                anchor_targets[asset] = w
+        bench_anchor.execute_month(asof, anchor_targets, contribution)
+
+        # Step 6: 归因 (锚 vs 倾斜增量)
+        if i > 0:
+            attr = _compute_attribution_v2(
+                asof, risk_weights, tilt_weights, returns_cny, md
+            )
+            attributions.append(attr)
+
+        # 记录 NAV
+        nav_series[dt] = portfolio.nav
+
+        # TWR
+        nav_after_mt = exec_rec.nav_before
+        nav_before_mt = prev_nav_after_exec if i > 0 else 0
+        if i > 0 and nav_before_mt > 0:
+            market_return = (nav_after_mt - nav_before_mt) / nav_before_mt
+            cumulative_return *= (1 + market_return)
+        twr_series[dt] = cumulative_return
+        prev_nav_after_exec = exec_rec.nav_after
+
+    # 构建结果
+    nav_idx = pd.Series(twr_series)
+    if len(nav_idx) > 0 and nav_idx.iloc[0] > 0:
+        nav_idx = nav_idx / nav_idx.iloc[0]
+
+    return BacktestResult(
+        strategy_nav=nav_idx,
+        benchmark_navs={
+            "anchor_only": bench_anchor.nav_series(),
+            "static_60_40": bench_6040.nav_series(),
+            "equal_weight": bench_ew.nav_series(),
+        },
+        total_nav=pd.Series(nav_series),
+        weight_history=weight_history,
+        executions=executions,
+        attribution=attributions,
+        total_costs=portfolio.total_cost_paid,
+        params_hash=params.params_hash,
+        start_date=str(dates[0].date()),
+        end_date=str(dates[-1].date()),
+    )
+
+
+def _compute_attribution_v2(
+    asof: date,
+    risk_weights: dict[str, float],
+    tilt_weights: dict[str, float],
+    returns: dict[str, float],
+    md: "MarketDataProvider",
+) -> AttributionRecord:
+    """v2 归因: 锚 vs 倾斜增量 (核心验证目标)。"""
+    # 锚回报: 风险权重 × 回报
+    r_anchor = sum(risk_weights.get(a, 0.0) * returns.get(a, 0.0) for a in risk_weights)
+
+    # 倾斜后回报: 倾斜权重 × 回报
+    r_tilted = sum(tilt_weights.get(a, 0.0) * returns.get(a, 0.0) for a in tilt_weights)
+
+    # 倾斜增量
+    tilt_incremental = r_tilted - r_anchor
+
+    return AttributionRecord(
+        asof=asof,
+        E_timing=0.0,  # 新架构无 E 择时
+        regional_tilt=tilt_incremental,  # 旧字段映射
+        defensive_comp=0.0,  # 防御层无倾斜
+        style=0.0,
+        residual=0.0,
+        total=r_tilted,
+        anchor_return=r_anchor,
+        tilt_incremental=tilt_incremental,
     )

@@ -1,5 +1,5 @@
-version: 1
-params_hash: sha256:1d504df889ac7523
+version: 2
+params_hash: sha256:fd429530c61f8b88
 E_base: 0.6
 k0: 0.2
 E_min: 0.4
@@ -25,3 +25,12 @@ kelly_fraction: 0.25
 active_name_cap: 0.1
 band_rel: 0.25
 band_abs: 0.05
+attack_defense_ratio: 0.5
+tilt_band_pp: 0.05
+w_val: 0.5
+w_mom: 0.5
+tilt_max: 0.1
+no_trade_cost_multiplier: 2.0
+no_trade_min_band: 0.02
+no_trade_max_band: 0.1
+target_vol: 0.1

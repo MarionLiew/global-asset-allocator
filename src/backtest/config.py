@@ -46,41 +46,54 @@ class BacktestConfig:
 @dataclass(frozen=True)
 class Params:
     """冻结策略参数。从 params.yaml 加载, 验证 hash。"""
-    version: int = 1
+    version: int = 2
     params_hash: str = ""
 
-    # Layer 0
+    # ── 旧 Layer 0 (保留向后兼容，旧测试仍用) ──
     E_base: float = 0.60
     k0: float = 0.20
     E_min: float = 0.40
     E_max: float = 0.80
 
-    # Layer 1
+    # ── 旧 Layer 1 (保留向后兼容) ──
     lambda_: dict[str, float] = field(default_factory=lambda: {"US": 0.6, "DM": 0.6, "CN": 0.3, "HK": 0.3})
     band_pp: float = 0.15
     delta_home: float = 0.03
     cape_target_window: int = 120
 
-    # Layer 2
+    # ── 旧 Layer 2 (保留向后兼容) ──
     delta_quadrant: float = 0.08
     defensive_single_asset_cap: float = 0.45
     ewma_fast_halflife: int = 6
     ewma_slow_halflife: int = 36
     ewma_mix_weight: float = 0.7
 
-    # 执行
+    # ── 旧执行/预留 (保留向后兼容) ──
     H: float = 10.0
-
-    # Layer 3 (stub)
     tau: float = 0.5
     n_min: int = 24
     breadth_min: int = 20
     kelly_fraction: float = 0.25
     active_name_cap: float = 0.10
-
-    # 再平衡
     band_rel: float = 0.25
     band_abs: float = 0.05
+
+    # ── 新: 锚层 (ALLOCATOR_PLAN §一A) ──
+    attack_defense_ratio: float = 0.50   # 进攻占总风险的固定比例
+
+    # ── 新: 倾斜层 (ALLOCATOR_PLAN §一B) ──
+    tilt_band_pp: float = 0.05           # 偏离锚硬上限 (风险口径)
+    w_val: float = 0.50                  # 估值信号权重
+    w_mom: float = 0.50                  # 动量信号权重
+    tilt_max: float = 0.10               # 最大倾斜幅度 (占子组权重)
+
+    # ── 新: 执行层 (ALLOCATOR_PLAN §一C) ──
+    no_trade_cost_multiplier: float = 2.0  # 带宽 = 成本 * 倍数
+    no_trade_min_band: float = 0.02        # 最小绝对带宽 2%
+    no_trade_max_band: float = 0.10        # 最大绝对带宽 10%
+
+    # ── 新: 风险报告 ──
+    target_vol: float = 0.10             # 组合目标波动率 (年化, 纯报告用)
 
     @classmethod
     def load(cls, path: str | Path = "config/params.yaml") -> Params:

@@ -66,6 +66,12 @@ class SyntheticProvider:
     def fx_rate(self, currency: str, asof: date) -> float:
         return {"CNY": 1.0, "USD": 7.2, "HKD": 0.92}.get(currency, 1.0)
 
+    def momentum(self, market: str, asof: date) -> float:
+        """标准化动量分数 (确定性, 基于月份哈希)。"""
+        month_idx = asof.month + asof.year * 12
+        np.random.seed(hash(("momentum", market, month_idx)) % 2**31)
+        return float(np.clip(np.random.normal(0, 0.3), -1, 1))
+
     def get_available_dates(self) -> list[pd.Timestamp]:
         return pd.date_range("1995-01-31", periods=self.n_months, freq="ME")
 

@@ -12,6 +12,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from ._constants import EQUITY_MARKETS, MOMENTUM_LOOKBACK, MOMENTUM_SKIP
+
 logger = logging.getLogger(__name__)
 
 BASE_DIR = Path(__file__).parent.parent.parent.parent
@@ -140,6 +142,60 @@ def build_macro_data(save: bool = True) -> pd.DataFrame:
     return macro
 
 
+def build_momentum(save: bool = True) -> pd.DataFrame:
+    """从 ETF 回报计算 12-1 动量, 横截面 z-score, 输出 processed/momentum.parquet。
+
+    动量 = cum_log_return[t-12 : t-2], 跳过最近 1 个月。
+    每月跨所有股票市场做 z-score 标准化, clip 到 [-1, +1]。
+    """
+    raw = RAW_DIR / "etf" / "all_etf_returns.csv"
+    if not raw.exists():
+        logger.warning(f"ETF 回报文件不存在: {raw}, 跳过动量计算")
+        return pd.DataFrame()
+
+    df = pd.read_csv(raw, parse_dates=["date"])
+    df["date"] = df["date"].dt.to_period("M").dt.to_timestamp("M")
+
+    # 只取股票市场
+    equity = df[df["asset_id"].isin(EQUITY_MARKETS)].copy()
+    if equity.empty:
+        logger.warning("无股票市场回报数据, 跳过动量")
+        return pd.DataFrame()
+
+    # pivot → (date, market) 回报矩阵
+    ret_matrix = equity.pivot_table(
+        index="date", columns="asset_id", values="return_m"
+    ).sort_index()
+
+    lookback = MOMENTUM_LOOKBACK
+    skip = MOMENTUM_SKIP
+
+    # 12-1 动量: 累积 log return [t-12, t-2]
+    log_ret = np.log(1 + ret_matrix)
+    # 先 rolling sum 全窗口, 再 shift 跳过最近 skip 个月
+    mom_raw = log_ret.rolling(window=lookback, min_periods=lookback).sum().shift(skip)
+
+    # 横截面 z-score
+    mom_mean = mom_raw.mean(axis=1)
+    mom_std = mom_raw.std(axis=1).replace(0, np.nan)
+    mom_z = mom_raw.sub(mom_mean, axis=1).div(mom_std, axis=1)
+    mom_z = mom_z.clip(-1, 1)
+
+    # 转长格式
+    mom_long = mom_z.stack().reset_index()
+    mom_long.columns = ["date", "market", "momentum"]
+    mom_long = mom_long.dropna(subset=["momentum"])
+    mom_long = mom_long.sort_values(["market", "date"]).reset_index(drop=True)
+
+    if save:
+        PROC_DIR.mkdir(parents=True, exist_ok=True)
+        mom_long.to_parquet(PROC_DIR / "momentum.parquet", index=False)
+        n_markets = mom_long["market"].nunique()
+        logger.info(f"✅ 动量: {len(mom_long)} 行, {n_markets} 市场")
+
+    return mom_long
+
+
 def build_all():
     """构建所有 processed 数据。"""
     logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -148,6 +204,7 @@ def build_all():
     build_cape_series()
     build_fx_rates()
     build_macro_data()
+    build_momentum()
     logger.info("\n✅ 所有 processed 数据构建完成!")
 
 
