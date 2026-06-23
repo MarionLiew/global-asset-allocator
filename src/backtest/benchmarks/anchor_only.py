@@ -29,8 +29,18 @@ class AnchorOnlyBenchmark:
         self.bt_cfg = bt_cfg
         self.all_legs = all_legs
         self.holdings: dict[str, float] = {}
-        self.nav_history: dict = {}
-        self._nav_at_last_dt: dict[str, float] = {}
+        # TWR: 记录 mark-to-market 后、贡献注入前的 NAV
+        self._nav_after_mt: list[tuple[date, float]] = []
+
+    def mark_to_market(self, returns_cny: dict[str, float], asof: date):
+        """用已实现回报更新各腿市值 (在贡献注入前调用)。"""
+        for leg in list(self.holdings.keys()):
+            data_key = leg.replace("_equity", "")
+            ret = returns_cny.get(data_key, 0.0)
+            self.holdings[leg] *= (1.0 + ret)
+        # 记录 mark-to-market 后的 NAV (贡献注入前, 用于 TWR)
+        nav = sum(self.holdings.values())
+        self._nav_after_mt.append((asof, nav))
 
     def execute_month(
         self,
@@ -38,48 +48,56 @@ class AnchorOnlyBenchmark:
         targets: dict[str, float],
         contribution_cny: float,
     ):
-        """月度执行: 注入新钱按目标权重分配 (无成本简化)。"""
+        """月度执行: 注入新钱 + 完全再平衡到目标权重 (无成本简化)。
+
+        在 mark_to_market() 之后调用。
+        完全再平衡 (非只买不卖), 避免超配累积偏差。
+        """
+        # 注入贡献
         nav = sum(self.holdings.values())
         available = contribution_cny + nav
 
+        # 完全再平衡: 直接设置为目标权重 × 可用资金
         for leg, tgt_w in targets.items():
-            target_cny = tgt_w * available
-            current_cny = self.holdings.get(leg, 0.0)
-            gap = target_cny - current_cny
-            if gap > 0:
-                self.holdings[leg] = current_cny + gap
-
-        self.nav_history[asof] = sum(self.holdings.values())
-
-    def mark_to_market(self, returns_cny: dict[str, float], asof: date):
-        """用已实现回报更新各腿市值。"""
-        for leg in list(self.holdings.keys()):
-            data_key = leg.replace("_equity", "")
-            ret = returns_cny.get(data_key, 0.0)
-            self.holdings[leg] *= (1.0 + ret)
-        self.nav_history[asof] = sum(self.holdings.values())
+            self.holdings[leg] = tgt_w * available
 
     def nav_series(self) -> pd.Series:
-        """返回 TWR 净值序列 (标准化到 1.0)。"""
-        if not self.nav_history:
+        """返回 TWR 净值序列 (标准化到 1.0)。
+
+        TWR = ∏ (1 + r_t), 其中 r_t = NAV_after_MT_t / NAV_after_exec_{t-1} - 1
+        NAV_after_MT = mark-to-market 后、贡献注入前
+        NAV_after_exec = 上月执行后 (含贡献)
+        """
+        if not self._nav_after_mt:
             return pd.Series(dtype=float)
-        s = pd.Series(self.nav_history).sort_index()
-        # 计算 TWR
+
+        dates = [d for d, _ in self._nav_after_mt]
+        navs_after_mt = [n for _, n in self._nav_after_mt]
+
+        # 第一个月: 只有贡献, 无回报
         twr = [1.0]
-        navs = s.values
-        for i in range(1, len(navs)):
-            # 需要分离贡献 vs 回报
-            # 简化: 直接用 NAV 变化 (因每月贡献相同且在月初注入)
-            if navs[i - 1] > 0:
-                # 估算月回报: (NAV_t - contribution) / NAV_{t-1} - 1
-                contribution = self.bt_cfg.monthly_contribution_cny
-                market_nav = navs[i] - contribution
-                if navs[i - 1] > 0:
-                    r = market_nav / navs[i - 1] - 1
-                    twr.append(twr[-1] * (1 + r))
-                else:
-                    twr.append(twr[-1])
+
+        for i in range(len(navs_after_mt)):
+            nav_mt = navs_after_mt[i]  # 本月 mark-to-market 后 (贡献前)
+
+            if i == 0:
+                # 第一个月: 贡献注入后 mark-to-market
+                # NAV_after_exec_0 = nav_mt + contribution
+                # 无上月参考, r=0
+                prev_exec_nav = nav_mt + self.bt_cfg.monthly_contribution_cny
+                continue
+
+            # r_t = (nav_after_MT_t - 上月执行后 NAV) / 上月执行后 NAV
+            #     = (nav_after_MT_t / 上月执行后 NAV) - 1
+            if prev_exec_nav > 0:
+                r = nav_mt / prev_exec_nav - 1
+                twr.append(twr[-1] * (1 + r))
             else:
-                twr.append(1.0)
-        result = pd.Series(twr, index=s.index)
+                twr.append(twr[-1])
+
+            # 本月执行后 NAV = nav_mt + contribution
+            prev_exec_nav = nav_mt + self.bt_cfg.monthly_contribution_cny
+
+        # 对齐日期: 第一个月 TWR=1.0, 之后每个月有回报
+        result = pd.Series(twr, index=dates)
         return result / result.iloc[0]

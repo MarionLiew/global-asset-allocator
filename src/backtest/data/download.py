@@ -135,16 +135,38 @@ def download_shiller_cape(save_dir: Path | None = None) -> pd.DataFrame:
 
         df = pd.read_excel(io.BytesIO(resp.content), sheet_name="Data", skiprows=[0, 1, 2])
 
-        # 找 CAPE 列
+        # 找 CAPE 列 — 优先精确匹配, 否则按列索引+范围校验
+        date_col = df.columns[0]
         cape_col = None
+
+        # 策略 1: 列名包含 "cape" 或 "p/e10"
         for col in df.columns:
-            if isinstance(col, str) and "cape" in col.lower():
-                cape_col = col
-                break
+            if isinstance(col, str):
+                cl = col.lower().strip()
+                if "cape" in cl or "p/e10" in cl or "pe10" in cl:
+                    cape_col = col
+                    break
+
+        # 策略 3: 尝试候选列索引, 用 1871 年 CAPE ≈ 10 校验
+        # Yale IE 数据列布局 (2024 版): [12]=P/E10 or CAPE, [14]=TR P/E10 or TR CAPE
+        if cape_col is None:
+            for idx in [12, 14, 10, 11]:
+                if idx < len(df.columns):
+                    candidate = df.columns[idx]
+                    vals = pd.to_numeric(df[candidate], errors="coerce").dropna()
+                    if len(vals) > 0:
+                        first_val = vals.iloc[0]
+                        # 1871 年 CAPE 应在 5~20 范围内
+                        if 4 < first_val < 25:
+                            cape_col = candidate
+                            logger.info(f"  CAPE 列通过范围校验: 列[{idx}]={candidate}, 首值={first_val:.1f}")
+                            break
+
+        # 策略 4: 兜底到列 10
         if cape_col is None:
             cape_col = df.columns[10] if len(df.columns) > 10 else df.columns[-1]
+            logger.warning(f"  CAPE 列未找到, 兜底到: {cape_col}")
 
-        date_col = df.columns[0]
         df = df[[date_col, cape_col]].dropna()
         df.columns = ["date_raw", "cape"]
 
@@ -166,6 +188,16 @@ def download_shiller_cape(save_dir: Path | None = None) -> pd.DataFrame:
         df = df[df["cape"] > 0]
 
         result = df[["date", "cape"]].copy()
+
+        # 合理性校验: CAPE 正常范围 4~60, 均值约 16
+        # 若均值 > 50, 大概率读了错误列
+        if len(result) > 0:
+            mean_cape = result["cape"].mean()
+            if mean_cape > 50:
+                logger.warning(
+                    f"  ⚠️ CAPE 均值 {mean_cape:.1f} 异常高 (正常约 16), "
+                    f"可能读了错误列。请检查 Yale 数据文件的列结构。"
+                )
         result["market"] = "US"
         result.to_csv(save_dir / "shiller_cape.csv", index=False)
         logger.info(f"  Shiller CAPE: {len(result)} 月 ({result['date'].min().date()} ~ {result['date'].max().date()})")

@@ -139,7 +139,7 @@ class CSVProvider:
         # 横截面 z-score（每月跨市场标准化）
         mom_mean = mom_raw.mean(axis=1)
         mom_std = mom_raw.std(axis=1).replace(0, np.nan)
-        mom_z = mom_raw.sub(mom_mean, axis=1).div(mom_std, axis=1)
+        mom_z = mom_raw.sub(mom_mean, axis=0).div(mom_std, axis=0)
         mom_z = mom_z.clip(-1, 1)  # clip 到 [-1, +1]
 
         # 转成长格式
