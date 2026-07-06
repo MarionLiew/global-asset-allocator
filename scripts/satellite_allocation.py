@@ -163,6 +163,8 @@ PHYSICAL_ACCOUNT = {
     "ZA": "ZA",
     "Schwab量化": "Schwab",
     "OKX量化": "OKX",
+    "同花顺手动": "同花顺",
+    "ZA手动": "ZA",
 }
 
 # 实体账户的打款货币
@@ -280,19 +282,22 @@ def main():
     else:
         print("\n=== 按账户占比 ===\n")
 
+    manual_accounts = set(cfg.get("manual_execution") or [])
+
     for physical, legs in sorted(by_account.items(), key=lambda x: -sum(w for _, _, w in x[1])):
         account_w = sum(w for _, _, w in legs)
         currency = ACCOUNT_CURRENCY.get(physical, "CNY")
+        manual_tag = "  〔标的自选: 各角色额度只约束资产类别〕" if physical in manual_accounts else ""
         if args.total is None:
-            print(f"{physical}  {account_w*100:.2f}%")
+            print(f"{physical}  {account_w*100:.2f}%{manual_tag}")
         else:
             amount_cny = args.total * account_w
             rate = fx_rate_to_cny.get(currency, 1.0)
             if currency == "CNY":
-                print(f"{physical}  {account_w*100:.2f}%  →  打款 ¥{amount_cny:,.0f}")
+                print(f"{physical}  {account_w*100:.2f}%  →  打款 ¥{amount_cny:,.0f}{manual_tag}")
             else:
                 print(f"{physical}  {account_w*100:.2f}%  →  打款 ¥{amount_cny:,.0f}"
-                      f"  ≈ {amount_cny/rate:,.0f} {currency}")
+                      f"  ≈ {amount_cny/rate:,.0f} {currency}{manual_tag}")
 
         legs_sorted = sorted(legs, key=lambda x: -x[2])
         for i, (sleeve, name, w) in enumerate(legs_sorted):
