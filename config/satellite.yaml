@@ -1,0 +1,28 @@
+# 主动策略风险预算 — 政策参数 (不常变, 改这里不用敲命令行参数)
+active_corr: 0.5          # 主动策略整体 vs 被动配置 的相关性假设 (用危机期数字, 偏保守)
+intra_active_corr: 0.5    # 同账户内/账户间多个策略彼此的相关性假设
+confidence_months: 36     # 需要多少个月实盘记录才算"满信心" (Carver: 通常要几年)
+full_confidence_sr: 1.0   # 满信心时, 收缩后夏普达到多少才给满风险预算上限
+risk_floor: 0.05          # 主动策略风险预算下限 (数据不足时的起步值)
+risk_cap_ceiling: 0.3     # 主动策略风险预算上限 (满信心时的政策上限)
+
+# 账户 -> 策略列表。每个账户可以放多个策略。
+# 每个策略优先从 stats_path 指向的 json 读取 {annual_vol, sharpe, track_months}
+# (方便接你别的项目跑出来的回测/实盘结果); stats_path 缺失或文件不存在时,
+# 回退用下面手填的 vol/sr/months。
+accounts:
+  Schwab量化:
+    strategies:
+      - name: 示例策略A
+        stats_path: null   # 例: ~/other-project/output/strategy_a_stats.json
+        vol: 0.15
+        sr: 0.0
+        months: 0
+
+  OKX量化:
+    strategies:
+      - name: 示例策略B
+        stats_path: null
+        vol: 0.30
+        sr: 0.0
+        months: 0

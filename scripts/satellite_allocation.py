@@ -2,29 +2,30 @@
 """
 被动配置 + 主动策略 两层风险预算计算 (Carver 式决策链条)。
 
+策略/账户配置全部放在 config/satellite.yaml, 命令行只用来管总金额/是否刷新数据。
+每个策略优先从 stats_path 指向的 json 读取 {annual_vol, sharpe, track_months}
+(接你别的项目跑出来的回测/实盘结果), 缺失时回退用 yaml 里手填的 vol/sr/months。
+
 决策链条:
-    1. 每个主动策略的夏普比率按实盘/回测月数向"零 edge 先验"收缩
-       (数据越少, 越接近假设没有 edge; 收缩满 --confidence-months 后不再收缩)
-    2. 主动策略整体的风险预算 = risk-floor 起步, 随"收缩后夏普 / 满信心夏普"
-       线性爬升到 risk-cap-ceiling (数据不够或夏普不够都拿不到高预算)
-    3. 主动策略内部 (Schwab量化 / OKX量化) 按各自波动率倒数做等风险权重分配
+    1. 每个策略的夏普按实盘月数向"零 edge 先验"收缩 (数据越少越接近假设没有 edge)
+    2. 同账户内多个策略、以及账户之间, 都按波动率倒数做等风险权重组合
        (Carver: 缺乏压倒性证据前默认等风险, 不按夏普差异分高低)
-    4. 用双资产风险贡献方程, 结合被动/主动波动率和相关性, 反推被动:主动的资金权重
-    5. 被动部分按原比例展开现有配置树 (current_allocation.py), 主动部分展开为
-       Schwab量化/OKX量化 两条腿, 一起打印成树形结果
+    3. 主动策略整体的风险预算 = risk-floor 起步, 随组合后的收缩夏普线性爬升到 risk-cap-ceiling
+    4. 双资产风险贡献方程, 结合被动/主动波动率和相关性, 反推被动:主动的资金权重
+    5. 被动部分展开现有配置树, 主动部分展开到 账户 -> 策略 两层, 一起打印成树形结果
 
 用法:
-    python scripts/satellite_allocation.py \
-        --schwab-quant-vol 0.15 --schwab-quant-sr 0.8 --schwab-quant-months 6 \
-        --okx-quant-vol 0.30 --okx-quant-sr 0.6 --okx-quant-months 3 \
-        --active-corr 0.5 --risk-cap-ceiling 0.3 --risk-floor 0.05 \
-        --confidence-months 36 --full-confidence-sr 1.0 \
-        --total 500000
+    python scripts/satellite_allocation.py                 # 用 config/satellite.yaml 里的参数
+    python scripts/satellite_allocation.py --total 500000   # 换算成具体金额
+    python scripts/satellite_allocation.py --satellite-config config/satellite.yaml
 """
 
 import argparse
+import json
 import sys
 from pathlib import Path
+
+import yaml
 
 PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
@@ -38,54 +39,97 @@ from current_allocation import (  # noqa: E402
 )
 
 
-def shrink_sharpe(observed_sr: float, track_months: int, confidence_months: int) -> float:
-    """把观测到的夏普比率, 按数据量向 0 (零 edge 先验) 收缩。"""
+def shrink_sharpe(observed_sr: float, track_months: int, confidence_months: int):
+    """把观测到的夏普比率, 按数据量向 0 (零 edge 先验) 收缩。返回 (收缩后夏普, 信心度)。"""
     confidence = min(1.0, track_months / confidence_months) if confidence_months > 0 else 1.0
     return confidence * observed_sr, confidence
 
 
-def combine_active_sleeve(legs: dict) -> dict:
-    """
-    legs: {name: {"vol": float, "sr": float, "months": int}}
-    组内按波动率倒数做等风险权重 (Carver: 缺乏证据前默认等风险, 不按夏普加权)。
-    返回组合后的 vol / 收缩后夏普 / 内部权重。
-    """
-    names = list(legs.keys())
-    inv_vol = {n: 1.0 / legs[n]["vol"] for n in names}
-    total_inv_vol = sum(inv_vol.values())
-    internal_w = {n: inv_vol[n] / total_inv_vol for n in names}
+def resolve_strategy_stats(strategy_cfg: dict) -> dict:
+    """优先读 stats_path 指向的外部 json ({annual_vol, sharpe, track_months}), 缺失则用 yaml 手填值。"""
+    stats_path = strategy_cfg.get("stats_path")
+    vol, sr, months = strategy_cfg.get("vol"), strategy_cfg.get("sr", 0.0), strategy_cfg.get("months", 0)
 
-    # 组合波动率 (假设组内相关性 intra_corr, 简化为两两相同)
-    intra_corr = legs[names[0]].get("intra_corr", 0.5) if len(names) > 1 else 0.0
+    if stats_path:
+        p = Path(stats_path).expanduser()
+        if p.exists():
+            with open(p) as f:
+                external = json.load(f)
+            vol = external.get("annual_vol", vol)
+            sr = external.get("sharpe", sr)
+            months = external.get("track_months", months)
+
+    if vol is None:
+        raise ValueError(f"策略 {strategy_cfg.get('name', '?')} 缺少波动率 (vol 或 stats_path.annual_vol)")
+
+    return {"vol": vol, "sr": sr, "months": months}
+
+
+def combine_pool(items: dict, intra_corr: float) -> dict:
+    """
+    items: {name: {"vol": .., "sr": .. (已经是要用于组合的有效夏普)}}
+    组内按波动率倒数做等风险权重, 假设两两相关性都是 intra_corr。
+    返回 {"vol": 组合波动率, "sr": 组合有效夏普, "weights": {name: 组内权重}}
+    """
+    names = list(items.keys())
+    if len(names) == 1:
+        n = names[0]
+        return {"vol": items[n]["vol"], "sr": items[n]["sr"], "weights": {n: 1.0}}
+
+    inv_vol = {n: 1.0 / items[n]["vol"] for n in names}
+    total_inv_vol = sum(inv_vol.values())
+    weights = {n: inv_vol[n] / total_inv_vol for n in names}
+
     var = 0.0
-    for i, a in enumerate(names):
-        for j, b in enumerate(names):
+    for a in names:
+        for b in names:
             rho = 1.0 if a == b else intra_corr
-            var += internal_w[a] * internal_w[b] * legs[a]["vol"] * legs[b]["vol"] * rho
+            var += weights[a] * weights[b] * items[a]["vol"] * items[b]["vol"] * rho
     combined_vol = var ** 0.5
 
-    shrunk = {}
-    expected_return = 0.0
-    for n in names:
-        sr_shrunk, confidence = shrink_sharpe(legs[n]["sr"], legs[n]["months"], legs[n]["confidence_months"])
-        shrunk[n] = {"sr_shrunk": sr_shrunk, "confidence": confidence}
-        expected_return += internal_w[n] * sr_shrunk * legs[n]["vol"]
+    expected_return = sum(weights[n] * items[n]["sr"] * items[n]["vol"] for n in names)
+    combined_sr = expected_return / combined_vol if combined_vol > 0 else 0.0
 
-    combined_sr_shrunk = expected_return / combined_vol if combined_vol > 0 else 0.0
+    return {"vol": combined_vol, "sr": combined_sr, "weights": weights}
 
-    return {
-        "vol": combined_vol,
-        "sr_shrunk": combined_sr_shrunk,
-        "internal_weights": internal_w,
-        "per_leg": shrunk,
-    }
+
+def build_active_sleeve(cfg: dict):
+    """
+    解析 config/satellite.yaml 的 accounts 结构:
+      account -> 策略们(先做叶子收缩+组合) -> 账户级 vol/sr
+      账户们 -> 组合 -> 整体主动策略 vol/sr
+    返回 (active_combined, account_level, per_strategy_detail)
+    """
+    confidence_months = cfg["confidence_months"]
+    intra_corr = cfg["intra_active_corr"]
+
+    account_level = {}
+    detail = {}
+
+    for account_name, account_cfg in cfg["accounts"].items():
+        leaf_items = {}
+        detail[account_name] = {}
+        for strat_cfg in account_cfg["strategies"]:
+            raw = resolve_strategy_stats(strat_cfg)
+            sr_shrunk, confidence = shrink_sharpe(raw["sr"], raw["months"], confidence_months)
+            leaf_items[strat_cfg["name"]] = {"vol": raw["vol"], "sr": sr_shrunk}
+            detail[account_name][strat_cfg["name"]] = {
+                "raw": raw, "sr_shrunk": sr_shrunk, "confidence": confidence,
+            }
+
+        combined = combine_pool(leaf_items, intra_corr)
+        account_level[account_name] = combined
+
+    active_pool = {name: {"vol": info["vol"], "sr": info["sr"]} for name, info in account_level.items()}
+    active_combined = combine_pool(active_pool, intra_corr)
+
+    return active_combined, account_level, detail
 
 
 def risk_contribution_of_active(w_active: float, vol_passive: float, vol_active: float, corr: float) -> float:
     """双资产 (被动, 主动) 组合中, 主动那部分占总风险的百分比 (Euler 风险贡献)。"""
     w_passive = 1.0 - w_active
-    cov_pp = vol_passive ** 2
-    cov_aa = vol_active ** 2
+    cov_pp, cov_aa = vol_passive ** 2, vol_active ** 2
     cov_pa = corr * vol_passive * vol_active
 
     sum_w_p = w_passive * cov_pp + w_active * cov_pa
@@ -104,7 +148,6 @@ def solve_active_weight(risk_budget_target: float, vol_passive: float, vol_activ
 
     lo, hi = 1e-6, 1 - 1e-6
     if f(lo) > 0:
-        # 即便主动权重趋近于0, 风险贡献已经超过目标 (说明主动波动率远高于被动) -> 给最小权重
         return lo
     if f(hi) < 0:
         return hi
@@ -116,48 +159,14 @@ def main():
     parser.add_argument("--refresh", action="store_true", help="先抓取最新市场数据")
     parser.add_argument("--params", default="config/params.yaml")
     parser.add_argument("--config", default="config/backtest.yaml")
+    parser.add_argument("--satellite-config", default="config/satellite.yaml", help="主动策略配置文件")
     parser.add_argument("--total", type=float, default=None, help="总资金 (人民币)。不指定则只输出比例")
-
-    parser.add_argument("--schwab-quant-vol", type=float, default=None, help="Schwab量化策略年化波动率假设")
-    parser.add_argument("--schwab-quant-sr", type=float, default=0.0, help="Schwab量化策略回测/实盘夏普")
-    parser.add_argument("--schwab-quant-months", type=int, default=0, help="Schwab量化策略实盘月数")
-
-    parser.add_argument("--okx-quant-vol", type=float, default=None, help="OKX量化策略年化波动率假设")
-    parser.add_argument("--okx-quant-sr", type=float, default=0.0, help="OKX量化策略回测/实盘夏普")
-    parser.add_argument("--okx-quant-months", type=int, default=0, help="OKX量化策略实盘月数")
-
-    parser.add_argument("--intra-active-corr", type=float, default=0.5,
-                         help="两个主动策略之间的相关性假设 (同一设计者的方法论重合风险, 默认偏保守)")
-    parser.add_argument("--active-corr", type=float, default=0.5,
-                         help="主动策略整体 与 被动配置 的相关性假设 (用危机期数字, 不用平静期数字)")
-    parser.add_argument("--confidence-months", type=int, default=36,
-                         help="需要多少个月实盘记录才算'满信心' (Carver: 通常要几年)")
-    parser.add_argument("--full-confidence-sr", type=float, default=1.0,
-                         help="满信心时, 收缩后夏普达到多少才给满风险预算上限")
-    parser.add_argument("--risk-floor", type=float, default=0.05, help="主动策略风险预算下限 (数据不足时的起步值)")
-    parser.add_argument("--risk-cap-ceiling", type=float, default=0.3, help="主动策略风险预算上限 (满信心时的政策上限)")
     parser.add_argument("--passive-vol", type=float, default=None,
                          help="被动配置目标波动率, 默认读 params.yaml 的 target_vol")
-
     args = parser.parse_args()
 
-    active_legs = {}
-    if args.schwab_quant_vol is not None:
-        active_legs["Schwab量化"] = {
-            "vol": args.schwab_quant_vol, "sr": args.schwab_quant_sr,
-            "months": args.schwab_quant_months, "confidence_months": args.confidence_months,
-            "intra_corr": args.intra_active_corr,
-        }
-    if args.okx_quant_vol is not None:
-        active_legs["OKX量化"] = {
-            "vol": args.okx_quant_vol, "sr": args.okx_quant_sr,
-            "months": args.okx_quant_months, "confidence_months": args.confidence_months,
-            "intra_corr": args.intra_active_corr,
-        }
-
-    if not active_legs:
-        print("未提供任何主动策略的波动率假设 (--schwab-quant-vol / --okx-quant-vol), 无法计算。")
-        sys.exit(1)
+    with open(args.satellite_config) as f:
+        cfg = yaml.safe_load(f)
 
     if args.refresh:
         refresh_data()
@@ -169,27 +178,34 @@ def main():
         from backtest.config import Params
         passive_vol = Params.load(args.params).target_vol
 
-    active = combine_active_sleeve(active_legs)
+    active_combined, account_level, detail = build_active_sleeve(cfg)
 
-    risk_budget_target = args.risk_floor + max(0.0, min(1.0, active["sr_shrunk"] / args.full_confidence_sr)) * (
-        args.risk_cap_ceiling - args.risk_floor
+    full_confidence_sr = cfg["full_confidence_sr"]
+    risk_floor, risk_cap_ceiling = cfg["risk_floor"], cfg["risk_cap_ceiling"]
+    risk_budget_target = risk_floor + max(0.0, min(1.0, active_combined["sr"] / full_confidence_sr)) * (
+        risk_cap_ceiling - risk_floor
     )
 
-    w_active = solve_active_weight(risk_budget_target, passive_vol, active["vol"], args.active_corr)
+    w_active = solve_active_weight(risk_budget_target, passive_vol, active_combined["vol"], cfg["active_corr"])
     w_passive = 1.0 - w_active
 
     print("\n=== Carver 式风险预算决策链条 ===\n")
-    for name, info in active["per_leg"].items():
-        leg = active_legs[name]
-        print(f"  {name}: 回测夏普={leg['sr']:.2f}, 实盘{leg['months']}个月 "
-              f"→ 信心={info['confidence']:.0%} → 收缩后夏普={info['sr_shrunk']:.2f}")
-    print(f"\n  主动策略组合波动率(等风险内部权重 {', '.join(f'{k}={v:.0%}' for k, v in active['internal_weights'].items())}) "
-          f"= {active['vol']:.1%}")
-    print(f"  主动策略组合收缩后夏普 = {active['sr_shrunk']:.2f}")
-    print(f"  → 风险预算 = {args.risk_floor:.0%} + "
-          f"min(1, {active['sr_shrunk']:.2f}/{args.full_confidence_sr:.2f}) × "
-          f"({args.risk_cap_ceiling:.0%} - {args.risk_floor:.0%}) = {risk_budget_target:.1%}")
-    print(f"  被动波动率={passive_vol:.1%}, 主动波动率={active['vol']:.1%}, 假设相关性={args.active_corr:.2f}")
+    for account_name, strategies in detail.items():
+        print(f"  [{account_name}]")
+        for strat_name, info in strategies.items():
+            raw = info["raw"]
+            print(f"    {strat_name}: vol={raw['vol']:.1%}, 回测夏普={raw['sr']:.2f}, "
+                  f"实盘{raw['months']}个月 → 信心={info['confidence']:.0%} → 收缩后夏普={info['sr_shrunk']:.2f}")
+        acc = account_level[account_name]
+        print(f"    → 账户组合: vol={acc['vol']:.1%}, 有效夏普={acc['sr']:.2f}, "
+              f"内部权重={ {k: f'{v:.0%}' for k, v in acc['weights'].items()} }")
+
+    print(f"\n  主动策略整体: vol={active_combined['vol']:.1%}, 有效夏普={active_combined['sr']:.2f}, "
+          f"账户间权重={ {k: f'{v:.0%}' for k, v in active_combined['weights'].items()} }")
+    print(f"  → 风险预算 = {risk_floor:.0%} + min(1, {active_combined['sr']:.2f}/{full_confidence_sr:.2f}) × "
+          f"({risk_cap_ceiling:.0%} - {risk_floor:.0%}) = {risk_budget_target:.1%}")
+    print(f"  被动波动率={passive_vol:.1%}, 主动波动率={active_combined['vol']:.1%}, "
+          f"假设相关性={cfg['active_corr']:.2f}")
     print(f"  → 解得 被动:主动 资金权重 = {w_passive:.1%} : {w_active:.1%}")
 
     fx_rate_to_cny, latest_fx_date = (None, None)
@@ -202,11 +218,27 @@ def main():
     accounts = build_account_tree(snap.targets)
     print_account_tree(accounts, scale=w_passive, total_cny=args.total, fx_rate_to_cny=fx_rate_to_cny, indent="  ")
 
-    # 每个主动策略走各自账户 (Schwab量化/OKX量化), 不合并
-    active_by_account = {name: {"currency": "USD", "legs": {name: w * w_active}}
-                          for name, w in active["internal_weights"].items()}
     print(f"主动策略  {w_active * 100:.2f}%")
-    print_account_tree(active_by_account, scale=1.0, total_cny=args.total, fx_rate_to_cny=fx_rate_to_cny, indent="  ")
+    for account_name, account_w_within_active in active_combined["weights"].items():
+        account_w = account_w_within_active * w_active
+        if args.total is None:
+            print(f"  {account_name}  {account_w * 100:.2f}%")
+        else:
+            amount_cny = args.total * account_w
+            print(f"  {account_name}  {account_w * 100:.2f}%  →  ¥{amount_cny:,.0f}")
+
+        strat_weights = account_level[account_name]["weights"]
+        strat_items = list(strat_weights.items())
+        for i, (strat_name, w_within_account) in enumerate(strat_items):
+            branch = "└─" if i == len(strat_items) - 1 else "├─"
+            strat_w = w_within_account * account_w
+            if args.total is None:
+                print(f"    {branch} {strat_name:12s} {strat_w * 100:6.2f}%  (占该账户 {w_within_account*100:5.1f}%)")
+            else:
+                amount_cny = args.total * strat_w
+                print(f"    {branch} {strat_name:12s} {strat_w * 100:6.2f}%  (占该账户 {w_within_account*100:5.1f}%)  "
+                      f"≈ ¥{amount_cny:,.0f}")
+        print()
 
     print("Polymarket  — 暂不参与风险预算, 待对冲策略确定后再纳入\n")
 
