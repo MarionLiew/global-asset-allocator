@@ -1,5 +1,5 @@
 version: 2
-params_hash: sha256:3b2d742ad00916e8
+params_hash: sha256:02c2eb6e0da2372a
 E_base: 0.6
 k0: 0.2
 E_min: 0.4
@@ -34,3 +34,4 @@ no_trade_cost_multiplier: 2.0
 no_trade_min_band: 0.02
 no_trade_max_band: 0.1
 target_vol: 0.1
+vol_floor: 0.05

@@ -55,9 +55,15 @@ class Portfolio:
         return w
 
     def mark_to_market(self, returns_cny: dict[str, float]):
-        """用已实现回报更新各腿市值 (CNY 计)。"""
-        for leg, ret in returns_cny.items():
-            if leg in self.holdings:
+        """用已实现回报更新各腿市值 (CNY 计)。
+
+        returns_cny 的键是数据键 (US/DM/...), 持仓键是腿名 (US_equity/...),
+        通过 LEG_DATA_KEY 映射后查找回报。
+        """
+        for leg in self.holdings:
+            data_key = LEG_DATA_KEY.get(leg, leg)
+            ret = returns_cny.get(data_key)
+            if ret is not None:
                 self.holdings[leg] *= (1.0 + ret)
 
     def add_holdings(self, leg: str, amount_cny: float):

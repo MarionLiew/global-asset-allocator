@@ -86,16 +86,25 @@ def test_attack_defense_ratio_configurable(provider, sample_date):
 # ── 等风险贡献 ────────────────────────────────────────────────────────────────
 
 
-def test_inverse_vol_ordering_in_subgroup(provider, sample_date):
-    """低波动率资产获得更高权重 (等风险贡献)。"""
-    # 直接测试子组函数
+def test_equal_risk_weights_in_subgroup(provider, sample_date):
+    """子组内风险权重纯等分 — vol 不进入风险空间 (只在 risk_to_cash 出现一次)。"""
     assets = ["US", "DM", "CN", "HK"]
     weights = _equal_risk_weights(assets, provider, sample_date)
 
-    # SyntheticProvider 中 US=16%, DM=18%, CN=25%, HK=22% (年化波动率)
-    # 1/vol: US > DM > HK > CN
-    assert weights["US"] > weights["DM"], "US 波动率低于 DM, 应获得更高权重"
-    assert weights["US"] > weights["CN"], "US 波动率远低于 CN"
+    for a in assets:
+        assert abs(weights[a] - 0.25) < 1e-9, f"{a} 风险权重={weights[a]}, 应等分为 0.25"
+
+
+def test_defense_group_structure(provider, params, sample_date):
+    """防御子树: rates/real_credit 两组等分, 组内叶子等分。"""
+    rw = compute_anchor_risk_weights(provider, params, sample_date)
+    defense_share = 1.0 - params.attack_defense_ratio
+    # rates 组 (2 资产): 每个 = defense * 0.5 / 2
+    assert abs(rw["CN_GOVT"] - defense_share * 0.25) < 1e-9
+    assert abs(rw["TIPS"] - defense_share * 0.25) < 1e-9
+    # real_credit 组 (3 资产): 每个 = defense * 0.5 / 3
+    for a in ["GOLD", "CORP_BOND", "EM_BOND"]:
+        assert abs(rw[a] - defense_share * 0.5 / 3) < 1e-9
 
 
 def test_subtree_weights_sum_to_one(provider, sample_date):

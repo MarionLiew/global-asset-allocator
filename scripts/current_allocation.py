@@ -39,7 +39,7 @@ def get_passive_snapshot(params_path="config/params.yaml", config_path="config/b
     """跑一遍被动配置模型, 返回最新一期的目标权重快照 (WeightSnapshot)。"""
     from backtest.config import Params, BacktestConfig
     from backtest.data.csv_provider import CSVProvider
-    from backtest.engine.backtest_loop import run_backtest
+    from backtest.engine.backtest_loop import run_backtest_v2
     import pandas as pd
 
     params = Params.load(params_path)
@@ -51,7 +51,7 @@ def get_passive_snapshot(params_path="config/params.yaml", config_path="config/b
     bt_cfg = dataclasses.replace(bt_cfg, end_date=latest_common.strftime("%Y-%m-%d"))
 
     md = CSVProvider(str(PROJECT_ROOT), params)
-    result = run_backtest(params, bt_cfg, md)
+    result = run_backtest_v2(params, bt_cfg, md)
     return result.weight_history[-1]
 
 

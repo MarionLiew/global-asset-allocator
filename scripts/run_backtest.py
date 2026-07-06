@@ -17,7 +17,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from backtest.config import Params, BacktestConfig
 from backtest.data.csv_provider import CSVProvider
-from backtest.engine.backtest_loop import run_backtest
+from backtest.engine.backtest_loop import run_backtest_v2
 from backtest.reporting.tables import compute_summary, compute_incremental
 from backtest.reporting.regime import compute_regime_analysis
 
@@ -58,7 +58,7 @@ def main():
 
     # 运行回测
     logger.info("开始回测...")
-    result = run_backtest(params, bt_cfg, md)
+    result = run_backtest_v2(params, bt_cfg, md)
 
     # 输出结果
     output_dir = Path(args.output)

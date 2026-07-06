@@ -258,6 +258,48 @@ def build_processed() -> None:
     build_all()
 
 
+# ─── sanity check ────────────────────────────────────────────────────────────
+
+def sanity_check() -> None:
+    """构建后校验 processed 数据, 异常直接报错退出而不是静默写入。
+
+    - CAPE 最新值应落在 [10, 60] (multpl 网页抓取脆弱, 解析错位会产生离谱数字)
+    - ETF 月度回报 |r| ≤ 50% (超过大概率是拆分/数据错位, 不是真实行情)
+    - 数据新鲜度: 各资产最新月距今不超过 3 个月 (超过则警告)
+    """
+    import datetime
+
+    import pandas as pd
+
+    errors = []
+
+    cape = pd.read_parquet(PROC_DIR / "cape_series.parquet")
+    latest_cape = float(cape.sort_values("date").iloc[-1]["cape"])
+    if not (10.0 <= latest_cape <= 60.0):
+        errors.append(f"CAPE 最新值 {latest_cape:.2f} 超出合理区间 [10, 60], 疑似解析错误")
+
+    etf = pd.read_parquet(PROC_DIR / "etf_returns.parquet")
+    extreme = etf[etf["return_m"].abs() > 0.5]
+    if not extreme.empty:
+        rows = ", ".join(f"{r.asset_id}@{r.date.date()}={r.return_m:.1%}"
+                          for r in extreme.itertuples())
+        errors.append(f"ETF 月度回报异常 (|r|>50%): {rows}")
+
+    today = pd.Timestamp(datetime.date.today())
+    staleness = etf.groupby("asset_id")["date"].max()
+    for asset, latest in staleness.items():
+        months_stale = (today.year - latest.year) * 12 + today.month - latest.month
+        if months_stale > 3:
+            logger.warning(f"  ⚠️ {asset} 数据最新到 {latest.date()}, 已滞后 {months_stale} 个月")
+
+    if errors:
+        for e in errors:
+            logger.error(f"  ❌ {e}")
+        raise SystemExit("数据 sanity check 未通过, processed 数据不可信, 请检查数据源")
+
+    logger.info(f"  ✅ sanity check 通过 (CAPE={latest_cape:.1f}, 无异常回报)")
+
+
 # ─── 主入口 ───────────────────────────────────────────────────────────────────
 
 def main():
@@ -293,6 +335,9 @@ def main():
 
     logger.info("\n=== 构建 processed/ parquet ===")
     build_processed()
+
+    logger.info("\n=== sanity check ===")
+    sanity_check()
 
     logger.info("\n✅ 完成! 可以运行回测:")
     logger.info("   python scripts/run_backtest.py")

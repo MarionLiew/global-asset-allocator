@@ -3,8 +3,10 @@
 
 ALLOCATOR_PLAN §一A:
   1. 顶层: attack/defense 按固定风险比分配 (config 冻结)
-  2. 每个子组内: 等风险贡献 (1/vol_j 归一化)
+  2. 树的每一层: 非空子组等分风险, 组内叶子等分风险
   3. 返回每个叶子的风险权重 risk_weight_i (总和=1)
+
+波动率不进入风险权重 — 只在 risk_to_cash 的风险→现金转换中出现一次。
 
 不变量:
   - 所有 risk_weights 之和 = 1.0
@@ -30,22 +32,15 @@ def _equal_risk_weights(
     provider: "MarketDataProvider",
     asof: date,
 ) -> dict[str, float]:
-    """子组内等风险贡献: risk_weight_j ∝ 1/vol_j, 归一化到总和=1。"""
+    """子组内等风险: 每个叶子等分风险权重 (1/n)。
+
+    此前这里用 1/vol 分配, 与 risk_to_cash 的再次除 vol 叠加成 1/vol²,
+    极端超配低波动资产。风险权重每层纯等分才是 handcrafting 的本意。
+    """
     if not assets:
         return {}
-
-    inv_vols: dict[str, float] = {}
-    for a in assets:
-        v = provider.vol(a, asof)
-        inv_vols[a] = 1.0 / v if v > 0 else 0.0
-
-    total = sum(inv_vols.values())
-    if total <= 0:
-        # fallback: 等权
-        n = len(assets)
-        return {a: 1.0 / n for a in assets}
-
-    return {a: iv / total for a, iv in inv_vols.items()}
+    n = len(assets)
+    return {a: 1.0 / n for a in assets}
 
 
 def _subtree_risk_weights(
@@ -53,45 +48,18 @@ def _subtree_risk_weights(
     provider: "MarketDataProvider",
     asof: date,
 ) -> dict[str, float]:
-    """递归计算子树的风险权重 (子树内部归一化到总和=1)。"""
+    """子树风险权重: 非空子组等分, 组内叶子等分 (子树内部总和=1)。"""
     result: dict[str, float] = {}
 
-    # 每个子组的组内等风险权重
-    group_internal: dict[str, dict[str, float]] = {}
-    for group_name, members in subtree.items():
-        group_internal[group_name] = _equal_risk_weights(members, provider, asof)
-
-    # 子组间的权重: 按子组的平均波动率反比分配
-    # (等风险贡献在组间层面: 波动率高的组获得更低权重)
-    group_avg_vol: dict[str, float] = {}
-    for group_name, members in subtree.items():
-        if not members:
-            group_avg_vol[group_name] = float("inf")
-            continue
-        vols = [provider.vol(a, asof) for a in members]
-        group_avg_vol[group_name] = sum(vols) / len(vols) if vols else float("inf")
-
-    # 组间等风险: 1/avg_vol, 归一化
-    active_groups = {g: v for g, v in group_avg_vol.items() if v < float("inf") and v > 0}
+    active_groups = [g for g, members in subtree.items() if members]
     if not active_groups:
-        # fallback: 等权
-        for group_name, members in subtree.items():
-            n = len(members)
-            if n > 0:
-                for a in members:
-                    result[a] = 1.0 / n / len(subtree)
         return result
 
-    inv_avg = {g: 1.0 / v for g, v in active_groups.items()}
-    total_inv = sum(inv_avg.values())
-    group_weights = {g: iv / total_inv for g, iv in inv_avg.items()}
-
-    # 合成: 叶子 = 组间权重 * 组内权重
-    for group_name, members in subtree.items():
-        gw = group_weights.get(group_name, 0.0)
-        internal = group_internal.get(group_name, {})
-        for a in members:
-            result[a] = gw * internal.get(a, 0.0)
+    group_w = 1.0 / len(active_groups)
+    for group_name in active_groups:
+        internal = _equal_risk_weights(subtree[group_name], provider, asof)
+        for a, w in internal.items():
+            result[a] = group_w * w
 
     return result
 

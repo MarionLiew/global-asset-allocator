@@ -95,6 +95,9 @@ class Params:
     # ── 新: 风险报告 ──
     target_vol: float = 0.10             # 组合目标波动率 (年化, 纯报告用)
 
+    # ── 新: 风险→现金转换 ──
+    vol_floor: float = 0.05              # 逆波动率转换的年化波动下限 (防低波资产吸走现金权重)
+
     @classmethod
     def load(cls, path: str | Path = "config/params.yaml") -> Params:
         with open(path) as f:

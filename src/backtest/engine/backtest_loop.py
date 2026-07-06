@@ -21,7 +21,7 @@ from .layer2 import compute_defensive_weights
 from .anchor import compute_anchor_risk_weights
 from .risk_to_cash import risk_weights_to_cash_weights
 from .execution import Portfolio, monthly_execute, monthly_execute_ntz
-from ..data._constants import EQUITY_MARKETS, DEFENSIVE_ASSETS, MARKET_CURRENCY
+from ..data._constants import EQUITY_MARKETS, DEFENSIVE_ASSETS
 
 if TYPE_CHECKING:
     from ..data.provider import MarketDataProvider
@@ -76,21 +76,12 @@ def run_backtest(
     for i, dt in enumerate(dates):
         asof = dt.date() if hasattr(dt, 'date') else dt
 
-        # Step 1: mark-to-market (上月回报)
+        # Step 1: mark-to-market (上月回报, CNY 折算)
         if i > 0:
-            prev_dt = dates[i - 1]
-            prev_asof = prev_dt.date() if hasattr(prev_dt, 'date') else prev_dt
             returns_cny = {}
             for leg in all_legs:
                 data_key = leg.replace("_equity", "")
-                ret = md.monthly_return(data_key, asof)
-                # FX 调整: 非 CNY 资产的回报需要考虑汇率变化
-                currency = MARKET_CURRENCY.get(data_key, "CNY")
-                if currency != "CNY":
-                    # 简化: 直接用本币回报 (FX 影响在后面处理)
-                    # 实际应该: ret_cny = (1+ret_local) * (fx_new/fx_old) - 1
-                    pass
-                returns_cny[data_key] = ret
+                returns_cny[data_key] = md.monthly_return_cny(data_key, asof)
 
             portfolio.mark_to_market(returns_cny)
 
@@ -312,36 +303,42 @@ def run_backtest_v2(
         #   这里只需确保 portfolio.cash 包含本月贡献
         #   (execute_month 会处理现金分配)
 
-        # Step 1: mark-to-market (回报覆盖含贡献的全部资产)
+        # Step 1: mark-to-market (回报覆盖含贡献的全部资产, CNY 折算)
         if i > 0:
             returns_cny = {}
             for leg in all_legs:
                 data_key = leg.replace("_equity", "")
-                ret = md.monthly_return(data_key, asof)
-                returns_cny[data_key] = ret
+                returns_cny[data_key] = md.monthly_return_cny(data_key, asof)
 
             portfolio.mark_to_market(returns_cny)
             bench_6040.mark_to_market(returns_cny, asof)
             bench_ew.mark_to_market(returns_cny, asof)
             bench_anchor.mark_to_market(returns_cny, asof)
 
-        # Step 2: 锚层
+        # Step 2: 锚层 → 倾斜 (风险空间) → 风险→现金 (执行口径)
         risk_weights = compute_anchor_risk_weights(md, params, asof)
-        cash_weights = risk_weights_to_cash_weights(risk_weights, md, asof)
         tilt_weights = compute_tilt(risk_weights, md, params, asof)
+        cash_weights = risk_weights_to_cash_weights(
+            tilt_weights, md, asof, vol_floor=params.vol_floor
+        )
 
         targets = {}
-        for asset, w in tilt_weights.items():
+        for asset, w in cash_weights.items():
             if asset in EQUITY_MARKETS:
                 targets[f"{asset}_equity"] = w
             else:
                 targets[asset] = w
 
+        # 兼容字段用现金口径 (报表/配置输出用)
+        E_cash = sum(cash_weights.get(m, 0) for m in EQUITY_MARKETS)
+        d_cash_total = sum(cash_weights.get(j, 0) for j in DEFENSIVE_ASSETS)
         snap = WeightSnapshot(
             asof=asof,
-            E=sum(tilt_weights.get(m, 0) for m in EQUITY_MARKETS),
-            m_i={m: tilt_weights.get(m, 0) for m in EQUITY_MARKETS},
-            d_j={j: tilt_weights.get(j, 0) for j in DEFENSIVE_ASSETS},
+            E=E_cash,
+            m_i={m: (cash_weights.get(m, 0) / E_cash if E_cash > 0 else 0.0)
+                 for m in EQUITY_MARKETS},
+            d_j={j: (cash_weights.get(j, 0) / d_cash_total if d_cash_total > 0 else 0.0)
+                 for j in DEFENSIVE_ASSETS},
             targets=dict(targets),
             params_hash=params.params_hash,
             risk_weights=dict(risk_weights),
@@ -362,29 +359,32 @@ def run_backtest_v2(
         )
         executions.append(exec_rec)
 
-        # 锚基准执行
+        # 锚基准执行 (无倾斜的锚现金权重, 与策略同口径可比)
+        anchor_cash = risk_weights_to_cash_weights(
+            risk_weights, md, asof, vol_floor=params.vol_floor
+        )
         anchor_targets = {}
-        for asset, w in risk_weights.items():
+        for asset, w in anchor_cash.items():
             if asset in EQUITY_MARKETS:
                 anchor_targets[f"{asset}_equity"] = w
             else:
                 anchor_targets[asset] = w
         bench_anchor.execute_month(asof, anchor_targets, contribution)
 
-        # Step 4: 归因
+        # Step 4: 归因 (现金口径: 锚现金权重 vs 倾斜后现金权重)
         if i > 0:
             attr = _compute_attribution_v2(
-                asof, risk_weights, tilt_weights, returns_cny, md
+                asof, anchor_cash, cash_weights, returns_cny, md
             )
             attributions.append(attr)
 
         # 记录 NAV
         nav_series[dt] = portfolio.nav
 
-        # TWR: 市场回报 = (NAV_MT - 上月执行后NAV) / 上月执行后NAV
-        # NAV_MT = mark-to-market 后 (含本月贡献回报)
-        # 上月执行后NAV = 上月末净值 (含上月贡献)
-        nav_after_mt = portfolio.nav  # MTM 后、执行前的 NAV
+        # TWR: 市场回报 = (MTM后执行前NAV - 上月执行后NAV) / 上月执行后NAV
+        # exec_rec.nav_before = 本月 mark-to-market 后、注资/交易前的 NAV
+        # prev_exec_nav = 上月执行后 NAV (含上月贡献) — 贡献不计入回报
+        nav_after_mt = exec_rec.nav_before
         if i > 0 and prev_exec_nav > 0:
             market_return = (nav_after_mt - prev_exec_nav) / prev_exec_nav
             cumulative_return *= (1 + market_return)
@@ -416,17 +416,14 @@ def run_backtest_v2(
 
 def _compute_attribution_v2(
     asof: date,
-    risk_weights: dict[str, float],
-    tilt_weights: dict[str, float],
+    anchor_cash: dict[str, float],
+    tilted_cash: dict[str, float],
     returns: dict[str, float],
     md: "MarketDataProvider",
 ) -> AttributionRecord:
-    """v2 归因: 锚 vs 倾斜增量 (核心验证目标)。"""
-    # 锚回报: 风险权重 × 回报
-    r_anchor = sum(risk_weights.get(a, 0.0) * returns.get(a, 0.0) for a in risk_weights)
-
-    # 倾斜后回报: 倾斜权重 × 回报
-    r_tilted = sum(tilt_weights.get(a, 0.0) * returns.get(a, 0.0) for a in tilt_weights)
+    """v2 归因: 锚 vs 倾斜增量 (核心验证目标), 现金权重口径。"""
+    r_anchor = sum(anchor_cash.get(a, 0.0) * returns.get(a, 0.0) for a in anchor_cash)
+    r_tilted = sum(tilted_cash.get(a, 0.0) * returns.get(a, 0.0) for a in tilted_cash)
 
     # 倾斜增量
     tilt_incremental = r_tilted - r_anchor

@@ -173,10 +173,12 @@ class CSVProvider:
         return self._cape_proxy(market, asof)
 
     def _cape_proxy(self, market: str, asof: date) -> float:
-        """CAPE 代理: 当无直接 CAPE 数据时, 用历史均值 + 一定波动。"""
-        # 默认 CAPE 值 (近似历史均值)
-        DEFAULT_CAPE = {"US": 20.0, "DM": 18.0, "CN": 15.0, "HK": 14.0}
-        return DEFAULT_CAPE.get(market, 18.0)
+        """无真实 CAPE 数据的市场返回 0 → 估值信号中性化。
+
+        之前返回写死的常数 (DM=18 vs 目标15 等), 相当于给非美市场注入
+        永久性的负估值信号 — 比没有信号更糟。没有数据就诚实地不给信号。
+        """
+        return 0.0
 
     def cape_target(self, market: str, asof: date) -> float:
         """CAPE 滚动中位 (目标值)。"""
@@ -249,11 +251,25 @@ class CSVProvider:
         return 0.0
 
     def monthly_return_cny(self, asset: str, asof: date) -> float:
-        """某资产 asof 月的总回报 (折 CNY)。"""
+        """某资产 asof 月的总回报 (折 CNY)。
+
+        ret_cny = (1 + ret_local) × (fx_t / fx_{t-1}) - 1
+        无汇率数据的月份 fx_rate 返回常数默认值, 比值为 1, 退化为本币回报。
+        """
+        from ._constants import MARKET_CURRENCY
+
         ret_local = self.monthly_return(asset, asof)
-        # 对于中国资产, 本身就是 CNY
-        # 对于 USD/HKD 资产, 需要乘以汇率变化
-        return ret_local  # 简化: FX 影响在 execution 中处理
+        currency = MARKET_CURRENCY.get(asset, "CNY")
+        if currency == "CNY":
+            return ret_local
+
+        asof_ts = pd.Timestamp(asof)
+        prev_ts = (asof_ts - pd.offsets.MonthEnd(1)).date()
+        fx_now = self.fx_rate(currency, asof)
+        fx_prev = self.fx_rate(currency, prev_ts)
+        if fx_prev <= 0:
+            return ret_local
+        return (1.0 + ret_local) * (fx_now / fx_prev) - 1.0
 
     def growth_inflation_quadrant(self, asof: date) -> str:
         """象限分类: GG/GI/IG/II。"""

@@ -21,8 +21,12 @@ def risk_weights_to_cash_weights(
     risk_weights: dict[str, float],
     provider: "MarketDataProvider",
     asof: date,
+    vol_floor: float = 0.05,
 ) -> dict[str, float]:
-    """将风险权重转换为现金权重: cash_i ∝ risk_weight_i / vol_i。
+    """将风险权重转换为现金权重: cash_i ∝ risk_weight_i / max(vol_i, vol_floor)。
+
+    vol_floor 防止波动率估计异常低的资产 (如合成的 CN_GOVT 长历史,
+    年化波动 ~2-3%) 通过 1/vol 吸走不成比例的现金权重。
 
     Parameters
     ----------
@@ -32,6 +36,8 @@ def risk_weights_to_cash_weights(
         数据源，提供 vol() 方法。
     asof : date
         当前日期 (PIT)。
+    vol_floor : float
+        年化波动率下限, 低于此值按此值计。
 
     Returns
     -------
@@ -45,7 +51,7 @@ def risk_weights_to_cash_weights(
     for asset, rw in risk_weights.items():
         vol = provider.vol(asset, asof)
         if vol > 0:
-            cash_raw[asset] = rw / vol
+            cash_raw[asset] = rw / max(vol, vol_floor)
         else:
             cash_raw[asset] = 0.0
 
