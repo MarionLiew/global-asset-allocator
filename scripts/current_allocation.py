@@ -76,30 +76,50 @@ def main():
     for k, v in sorted(snap.targets.items(), key=lambda x: -x[1]):
         print(f"  {k:15s} {v * 100:6.2f}%")
 
-    # 按账户汇总
-    account_weight = {}
+    # 按账户分组 (账户 -> currency, {leg: weight})
+    accounts = {}
     for k, v in snap.targets.items():
         account, currency = ASSET_ACCOUNT.get(k, ("未映射", "CNY"))
-        key = (account, currency)
-        account_weight[key] = account_weight.get(key, 0.0) + v
+        bucket = accounts.setdefault(account, {"currency": currency, "legs": {}})
+        bucket["legs"][k] = bucket["legs"].get(k, 0.0) + v
 
-    print("\n=== 按入金账户汇总 ===")
-    if args.total is None:
-        for (account, currency), w in sorted(account_weight.items(), key=lambda x: -x[1]):
-            print(f"  {account:16s} {w * 100:6.2f}%  ({currency})")
-        print("\n(未指定 --total, 只显示比例; 加 --total <人民币金额> 可算出具体入金金额)")
-    else:
+    fx_rate_to_cny = {}
+    if args.total is not None:
         fx = pd.read_parquet(PROJECT_ROOT / "data" / "processed" / "fx_rates.parquet")
         latest_fx_date = fx["date"].max()
-        rate_to_cny = fx[fx["date"] == latest_fx_date].set_index("currency")["rate_to_cny"].to_dict()
+        fx_rate_to_cny = fx[fx["date"] == latest_fx_date].set_index("currency")["rate_to_cny"].to_dict()
 
-        total_cny = args.total
-        for (account, currency), w in sorted(account_weight.items(), key=lambda x: -x[1]):
-            amount_cny = total_cny * w
-            rate = rate_to_cny.get(currency, 1.0)
+    print("\n=== 按入金账户汇总 (树形) ===\n")
+    account_order = sorted(accounts.items(), key=lambda x: -sum(x[1]["legs"].values()))
+    for account, info in account_order:
+        currency = info["currency"]
+        account_w = sum(info["legs"].values())
+        if args.total is None:
+            print(f"{account}  {account_w * 100:.2f}%  ({currency})")
+        else:
+            amount_cny = args.total * account_w
+            rate = fx_rate_to_cny.get(currency, 1.0)
             amount_native = amount_cny / rate
-            print(f"  {account:16s} ¥{amount_cny:>12,.0f}  ≈ {amount_native:>12,.2f} {currency}  ({w*100:5.2f}%)")
-        print(f"\n汇率基准: {latest_fx_date.date()}  ({', '.join(f'{c}={r:.4f}' for c, r in rate_to_cny.items() if c != 'CNY')})")
+            print(f"{account}  {account_w * 100:.2f}%  →  ¥{amount_cny:,.0f}  ≈ {amount_native:,.2f} {currency}")
+
+        legs_sorted = sorted(info["legs"].items(), key=lambda x: -x[1])
+        for i, (leg, w) in enumerate(legs_sorted):
+            branch = "└─" if i == len(legs_sorted) - 1 else "├─"
+            pct_of_account = w / account_w * 100 if account_w > 0 else 0
+            if args.total is None:
+                print(f"  {branch} {leg:12s} {w * 100:6.2f}%  (占该账户 {pct_of_account:5.1f}%)")
+            else:
+                leg_amount_cny = args.total * w
+                leg_amount_native = leg_amount_cny / fx_rate_to_cny.get(currency, 1.0)
+                print(f"  {branch} {leg:12s} {w * 100:6.2f}%  (占该账户 {pct_of_account:5.1f}%)  "
+                      f"≈ {leg_amount_native:,.2f} {currency}")
+        print()
+
+    if args.total is None:
+        print("(未指定 --total, 只显示比例; 加 --total <人民币金额> 可算出具体入金金额)")
+    else:
+        print(f"汇率基准: {latest_fx_date.date()}  "
+              f"({', '.join(f'{c}={r:.4f}' for c, r in fx_rate_to_cny.items() if c != 'CNY')})")
 
 
 if __name__ == "__main__":
