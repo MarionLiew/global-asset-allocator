@@ -1,0 +1,19 @@
+# 当前真实持仓 — 复制为 config/holdings.yaml 后填写 (holdings.yaml 已 gitignore, 不会被提交)
+#
+# amount 填各腿当前市值, 用该账户的计价货币:
+#   Schwab 腿 (US_equity/DM_equity/TIPS/CORP_BOND/EM_BOND) 填 USD
+#   同花顺腿 (CN_equity/CN_GOVT) 填 CNY
+#   ZA 腿 (HK_equity) 填 HKD
+#   OKX 腿 (GOLD) 填 USD
+# 没有持仓的腿填 0 或删掉整行。
+
+holdings:
+  US_equity:   0      # USD
+  DM_equity:   0      # USD
+  TIPS:        0      # USD
+  CORP_BOND:   0      # USD
+  EM_BOND:     0      # USD
+  GOLD:        0      # USD
+  CN_equity:   0      # CNY
+  CN_GOVT:     0      # CNY
+  HK_equity:   0      # HKD
