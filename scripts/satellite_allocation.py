@@ -31,10 +31,9 @@ PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from current_allocation import (  # noqa: E402
-    build_account_tree,
+    ASSET_ACCOUNT,
     get_passive_snapshot,
     latest_fx_rates,
-    print_account_tree,
     refresh_data,
 )
 
@@ -154,6 +153,51 @@ def solve_active_weight(risk_budget_target: float, vol_passive: float, vol_activ
     return brentq(f, lo, hi)
 
 
+# ── 展示层映射 ────────────────────────────────────────────────────────────────
+
+# 被动/主动的账户名 → 实体入金账户 (打款就打给这几个)
+PHYSICAL_ACCOUNT = {
+    "Schwab": "Schwab",
+    "OKX (XAUT现货)": "OKX",
+    "同花顺": "同花顺",
+    "ZA": "ZA",
+    "Schwab量化": "Schwab",
+    "OKX量化": "OKX",
+}
+
+# 实体账户的打款货币
+ACCOUNT_CURRENCY = {"Schwab": "USD", "OKX": "USD", "同花顺": "CNY", "ZA": "HKD"}
+
+# 资产大类 (总览用)
+ASSET_CLASS = {
+    "US_equity": "股票", "DM_equity": "股票", "CN_equity": "股票", "HK_equity": "股票",
+    "CN_GOVT": "债券", "TIPS": "债券", "CORP_BOND": "债券", "EM_BOND": "债券",
+    "GOLD": "黄金",
+}
+
+
+def print_decision_chain(detail, account_level, active_combined, cfg,
+                          risk_budget_target, passive_vol, w_passive, w_active):
+    print("\n=== Carver 式风险预算决策链条 ===\n")
+    for account_name, strategies in detail.items():
+        print(f"  [{account_name}]")
+        for strat_name, info in strategies.items():
+            raw = info["raw"]
+            print(f"    {strat_name}: vol={raw['vol']:.1%}, 回测夏普={raw['sr']:.2f}, "
+                  f"实盘{raw['months']}个月 → 信心={info['confidence']:.0%} → 收缩后夏普={info['sr_shrunk']:.2f}")
+        acc = account_level[account_name]
+        print(f"    → 账户组合: vol={acc['vol']:.1%}, 有效夏普={acc['sr']:.2f}, "
+              f"内部权重={ {k: f'{v:.0%}' for k, v in acc['weights'].items()} }")
+
+    print(f"\n  主动策略整体: vol={active_combined['vol']:.1%}, 有效夏普={active_combined['sr']:.2f}, "
+          f"账户间权重={ {k: f'{v:.0%}' for k, v in active_combined['weights'].items()} }")
+    print(f"  → 风险预算 = {cfg['risk_floor']:.0%} + min(1, {active_combined['sr']:.2f}/{cfg['full_confidence_sr']:.2f}) × "
+          f"({cfg['risk_cap_ceiling']:.0%} - {cfg['risk_floor']:.0%}) = {risk_budget_target:.1%}")
+    print(f"  被动波动率={passive_vol:.1%}, 主动波动率={active_combined['vol']:.1%}, "
+          f"假设相关性={cfg['active_corr']:.2f}")
+    print(f"  → 解得 被动:主动 资金权重 = {w_passive:.1%} : {w_active:.1%}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="被动配置 + 主动策略 风险预算计算 (Carver 式)")
     parser.add_argument("--refresh", action="store_true", help="先抓取最新市场数据")
@@ -163,6 +207,7 @@ def main():
     parser.add_argument("--total", type=float, default=None, help="总资金 (人民币)。不指定则只输出比例")
     parser.add_argument("--passive-vol", type=float, default=None,
                          help="被动配置目标波动率, 默认读 params.yaml 的 target_vol")
+    parser.add_argument("--verbose", action="store_true", help="显示 Carver 决策链条推导过程")
     args = parser.parse_args()
 
     with open(args.satellite_config) as f:
@@ -189,61 +234,83 @@ def main():
     w_active = solve_active_weight(risk_budget_target, passive_vol, active_combined["vol"], cfg["active_corr"])
     w_passive = 1.0 - w_active
 
-    print("\n=== Carver 式风险预算决策链条 ===\n")
-    for account_name, strategies in detail.items():
-        print(f"  [{account_name}]")
-        for strat_name, info in strategies.items():
-            raw = info["raw"]
-            print(f"    {strat_name}: vol={raw['vol']:.1%}, 回测夏普={raw['sr']:.2f}, "
-                  f"实盘{raw['months']}个月 → 信心={info['confidence']:.0%} → 收缩后夏普={info['sr_shrunk']:.2f}")
-        acc = account_level[account_name]
-        print(f"    → 账户组合: vol={acc['vol']:.1%}, 有效夏普={acc['sr']:.2f}, "
-              f"内部权重={ {k: f'{v:.0%}' for k, v in acc['weights'].items()} }")
+    if args.verbose:
+        print_decision_chain(detail, account_level, active_combined, cfg,
+                              risk_budget_target, passive_vol, w_passive, w_active)
 
-    print(f"\n  主动策略整体: vol={active_combined['vol']:.1%}, 有效夏普={active_combined['sr']:.2f}, "
-          f"账户间权重={ {k: f'{v:.0%}' for k, v in active_combined['weights'].items()} }")
-    print(f"  → 风险预算 = {risk_floor:.0%} + min(1, {active_combined['sr']:.2f}/{full_confidence_sr:.2f}) × "
-          f"({risk_cap_ceiling:.0%} - {risk_floor:.0%}) = {risk_budget_target:.1%}")
-    print(f"  被动波动率={passive_vol:.1%}, 主动波动率={active_combined['vol']:.1%}, "
-          f"假设相关性={cfg['active_corr']:.2f}")
-    print(f"  → 解得 被动:主动 资金权重 = {w_passive:.1%} : {w_active:.1%}")
+    # ── 汇总所有腿到实体账户: (实体账户, 类型标签, 名称, 全局权重) ──
+    rows = []
+    for leg, w in snap.targets.items():
+        src_account, _ = ASSET_ACCOUNT.get(leg, ("未映射", "CNY"))
+        physical = PHYSICAL_ACCOUNT.get(src_account, src_account)
+        rows.append((physical, "被动", leg, w * w_passive))
+    for account_name, w_in_active in active_combined["weights"].items():
+        physical = PHYSICAL_ACCOUNT.get(account_name, account_name)
+        for strat_name, w_in_account in account_level[account_name]["weights"].items():
+            rows.append((physical, "量化", strat_name, w_in_active * w_in_account * w_active))
 
+    # ── 总览: 资产大类占比 + 股债比 ──
+    class_totals: dict[str, float] = {}
+    for _, sleeve, name, w in rows:
+        cls = "主动策略" if sleeve == "量化" else ASSET_CLASS.get(name, "其他")
+        class_totals[cls] = class_totals.get(cls, 0.0) + w
+
+    stock = class_totals.get("股票", 0.0)
+    bond = class_totals.get("债券", 0.0)
+    sb_total = stock + bond
+    print(f"\n=== 总览 (基于 {snap.asof} 数据) ===\n")
+    parts = [f"{cls} {w*100:.1f}%" for cls, w in
+             sorted(class_totals.items(), key=lambda x: -x[1])]
+    print("  " + "  |  ".join(parts))
+    if sb_total > 0:
+        print(f"  股债比 = {stock/sb_total*100:.0f} : {bond/sb_total*100:.0f}"
+              f"  (被动:主动 = {w_passive*100:.0f} : {w_active*100:.0f})")
+
+    # ── 按实体账户: 打款总额 + 内部明细 ──
     fx_rate_to_cny, latest_fx_date = (None, None)
     if args.total is not None:
         fx_rate_to_cny, latest_fx_date = latest_fx_rates()
 
-    print(f"\n=== 配置树 (被动配置 {w_passive:.1%} / 主动策略 {w_active:.1%}) ===\n")
+    by_account: dict[str, list] = {}
+    for physical, sleeve, name, w in rows:
+        by_account.setdefault(physical, []).append((sleeve, name, w))
 
-    print(f"被动配置  {w_passive * 100:.2f}%")
-    accounts = build_account_tree(snap.targets)
-    print_account_tree(accounts, scale=w_passive, total_cny=args.total, fx_rate_to_cny=fx_rate_to_cny, indent="  ")
+    if args.total is not None:
+        print(f"\n=== 按账户入金 (总资金 ¥{args.total:,.0f}) ===\n")
+    else:
+        print("\n=== 按账户占比 ===\n")
 
-    print(f"主动策略  {w_active * 100:.2f}%")
-    for account_name, account_w_within_active in active_combined["weights"].items():
-        account_w = account_w_within_active * w_active
+    for physical, legs in sorted(by_account.items(), key=lambda x: -sum(w for _, _, w in x[1])):
+        account_w = sum(w for _, _, w in legs)
+        currency = ACCOUNT_CURRENCY.get(physical, "CNY")
         if args.total is None:
-            print(f"  {account_name}  {account_w * 100:.2f}%")
+            print(f"{physical}  {account_w*100:.2f}%")
         else:
             amount_cny = args.total * account_w
-            print(f"  {account_name}  {account_w * 100:.2f}%  →  ¥{amount_cny:,.0f}")
-
-        strat_weights = account_level[account_name]["weights"]
-        strat_items = list(strat_weights.items())
-        for i, (strat_name, w_within_account) in enumerate(strat_items):
-            branch = "└─" if i == len(strat_items) - 1 else "├─"
-            strat_w = w_within_account * account_w
-            if args.total is None:
-                print(f"    {branch} {strat_name:12s} {strat_w * 100:6.2f}%  (占该账户 {w_within_account*100:5.1f}%)")
+            rate = fx_rate_to_cny.get(currency, 1.0)
+            if currency == "CNY":
+                print(f"{physical}  {account_w*100:.2f}%  →  打款 ¥{amount_cny:,.0f}")
             else:
-                amount_cny = args.total * strat_w
-                print(f"    {branch} {strat_name:12s} {strat_w * 100:6.2f}%  (占该账户 {w_within_account*100:5.1f}%)  "
-                      f"≈ ¥{amount_cny:,.0f}")
+                print(f"{physical}  {account_w*100:.2f}%  →  打款 ¥{amount_cny:,.0f}"
+                      f"  ≈ {amount_cny/rate:,.0f} {currency}")
+
+        legs_sorted = sorted(legs, key=lambda x: -x[2])
+        for i, (sleeve, name, w) in enumerate(legs_sorted):
+            branch = "└─" if i == len(legs_sorted) - 1 else "├─"
+            label = f"[{sleeve}] {name}"
+            if args.total is None:
+                print(f"  {branch} {label:24s} {w*100:6.2f}%")
+            else:
+                leg_cny = args.total * w
+                rate = fx_rate_to_cny.get(currency, 1.0)
+                if currency == "CNY":
+                    print(f"  {branch} {label:24s} {w*100:6.2f}%  ≈ ¥{leg_cny:,.0f}")
+                else:
+                    print(f"  {branch} {label:24s} {w*100:6.2f}%  ≈ {leg_cny/rate:,.0f} {currency}")
         print()
 
-    print("Polymarket  — 暂不参与风险预算, 待对冲策略确定后再纳入\n")
-
     if args.total is None:
-        print("(未指定 --total, 只显示比例; 加 --total <人民币金额> 可算出具体入金金额)")
+        print("(加 --total <人民币金额> 可算出每个账户具体打款金额; --verbose 看推导过程)")
     else:
         print(f"汇率基准: {latest_fx_date.date()}  "
               f"({', '.join(f'{c}={r:.4f}' for c, r in fx_rate_to_cny.items() if c != 'CNY')})")
