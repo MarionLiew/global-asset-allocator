@@ -153,6 +153,38 @@ def solve_active_weight(risk_budget_target: float, vol_passive: float, vol_activ
     return brentq(f, lo, hi)
 
 
+def compute_active_split(cfg: dict, passive_vol: float):
+    """整条决策链一步到位: satellite.yaml 配置 + 被动波动率 → 被动/主动资金拆分。
+
+    返回 (w_active, active_combined, account_level, detail, risk_budget_target)。
+    """
+    active_combined, account_level, detail = build_active_sleeve(cfg)
+    risk_budget_target = cfg["risk_floor"] + max(
+        0.0, min(1.0, active_combined["sr"] / cfg["full_confidence_sr"])
+    ) * (cfg["risk_cap_ceiling"] - cfg["risk_floor"])
+    w_active = solve_active_weight(
+        risk_budget_target, passive_vol, active_combined["vol"], cfg["active_corr"]
+    )
+    return w_active, active_combined, account_level, detail, risk_budget_target
+
+
+def active_strategy_rows(w_active, active_combined, account_level):
+    """展开主动层到 (策略key, 实体账户, 币种, 全局资金权重) 列表。
+
+    策略名跨账户重名时加账户前缀保证 key 唯一。
+    """
+    rows = []
+    seen = set()
+    for account_name, w_in_active in active_combined["weights"].items():
+        physical = PHYSICAL_ACCOUNT.get(account_name, account_name)
+        currency = ACCOUNT_CURRENCY.get(physical, "CNY")
+        for strat, w_in_account in account_level[account_name]["weights"].items():
+            key = strat if strat not in seen else f"{account_name}:{strat}"
+            seen.add(key)
+            rows.append((key, physical, currency, w_active * w_in_active * w_in_account))
+    return rows
+
+
 # ── 展示层映射 ────────────────────────────────────────────────────────────────
 
 # 被动/主动的账户名 → 实体入金账户 (打款就打给这几个)
@@ -225,15 +257,9 @@ def main():
         from backtest.config import Params
         passive_vol = Params.load(args.params).target_vol
 
-    active_combined, account_level, detail = build_active_sleeve(cfg)
-
-    full_confidence_sr = cfg["full_confidence_sr"]
-    risk_floor, risk_cap_ceiling = cfg["risk_floor"], cfg["risk_cap_ceiling"]
-    risk_budget_target = risk_floor + max(0.0, min(1.0, active_combined["sr"] / full_confidence_sr)) * (
-        risk_cap_ceiling - risk_floor
+    w_active, active_combined, account_level, detail, risk_budget_target = compute_active_split(
+        cfg, passive_vol
     )
-
-    w_active = solve_active_weight(risk_budget_target, passive_vol, active_combined["vol"], cfg["active_corr"])
     w_passive = 1.0 - w_active
 
     if args.verbose:
@@ -246,10 +272,8 @@ def main():
         src_account, _ = ASSET_ACCOUNT.get(leg, ("未映射", "CNY"))
         physical = PHYSICAL_ACCOUNT.get(src_account, src_account)
         rows.append((physical, "被动", leg, w * w_passive))
-    for account_name, w_in_active in active_combined["weights"].items():
-        physical = PHYSICAL_ACCOUNT.get(account_name, account_name)
-        for strat_name, w_in_account in account_level[account_name]["weights"].items():
-            rows.append((physical, "量化", strat_name, w_in_active * w_in_account * w_active))
+    for key, physical, _currency, w in active_strategy_rows(w_active, active_combined, account_level):
+        rows.append((physical, "量化", key, w))
 
     # ── 总览: 资产大类占比 + 股债比 ──
     class_totals: dict[str, float] = {}

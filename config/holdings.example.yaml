@@ -17,3 +17,10 @@ holdings:
   CN_equity:   0      # CNY
   CN_GOVT:     0      # CNY
   HK_equity:   0      # HKD
+
+# 主动策略当前占用的资金 (策略名须与 config/satellite.yaml 的 strategies.name 一致),
+# 用该策略所在实体账户的计价货币: Schwab量化 填 USD, OKX量化 填 USD,
+# 同花顺手动 填 CNY, ZA手动 填 HKD。没跑的策略填 0 或删掉整行。
+active_holdings:
+  示例策略A:   0      # USD (Schwab量化)
+  示例策略B:   0      # USD (OKX量化)
