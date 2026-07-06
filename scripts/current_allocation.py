@@ -3,8 +3,9 @@
 输出基于最新数据的目标配置权重。
 
 用法:
-    python scripts/current_allocation.py            # 用现有 processed 数据
-    python scripts/current_allocation.py --refresh   # 先抓取最新数据再计算
+    python scripts/current_allocation.py                  # 只看比例
+    python scripts/current_allocation.py --refresh         # 先抓取最新数据再计算
+    python scripts/current_allocation.py --total 500000    # 按人民币总金额算出每个账户该入多少钱
 """
 
 import argparse
@@ -15,12 +16,26 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
+# leg -> (入金账户, 计价货币)
+ASSET_ACCOUNT = {
+    "US_equity":  ("Schwab", "USD"),
+    "DM_equity":  ("Schwab", "USD"),
+    "TIPS":       ("Schwab", "USD"),
+    "CORP_BOND":  ("Schwab", "USD"),
+    "EM_BOND":    ("Schwab", "USD"),
+    "GOLD":       ("OKX (XAUT现货)", "USD"),
+    "CN_equity":  ("同花顺", "CNY"),
+    "CN_GOVT":    ("同花顺", "CNY"),
+    "HK_equity":  ("ZA", "HKD"),
+}
+
 
 def main():
     parser = argparse.ArgumentParser(description="计算最新目标配置权重")
     parser.add_argument("--refresh", action="store_true", help="先抓取最新市场数据")
     parser.add_argument("--params", default="config/params.yaml")
     parser.add_argument("--config", default="config/backtest.yaml")
+    parser.add_argument("--total", type=float, default=None, help="本次入金总金额 (人民币)。不指定则只输出比例")
     args = parser.parse_args()
 
     if args.refresh:
@@ -60,6 +75,31 @@ def main():
     print("\n=== 完整明细 (targets) ===")
     for k, v in sorted(snap.targets.items(), key=lambda x: -x[1]):
         print(f"  {k:15s} {v * 100:6.2f}%")
+
+    # 按账户汇总
+    account_weight = {}
+    for k, v in snap.targets.items():
+        account, currency = ASSET_ACCOUNT.get(k, ("未映射", "CNY"))
+        key = (account, currency)
+        account_weight[key] = account_weight.get(key, 0.0) + v
+
+    print("\n=== 按入金账户汇总 ===")
+    if args.total is None:
+        for (account, currency), w in sorted(account_weight.items(), key=lambda x: -x[1]):
+            print(f"  {account:16s} {w * 100:6.2f}%  ({currency})")
+        print("\n(未指定 --total, 只显示比例; 加 --total <人民币金额> 可算出具体入金金额)")
+    else:
+        fx = pd.read_parquet(PROJECT_ROOT / "data" / "processed" / "fx_rates.parquet")
+        latest_fx_date = fx["date"].max()
+        rate_to_cny = fx[fx["date"] == latest_fx_date].set_index("currency")["rate_to_cny"].to_dict()
+
+        total_cny = args.total
+        for (account, currency), w in sorted(account_weight.items(), key=lambda x: -x[1]):
+            amount_cny = total_cny * w
+            rate = rate_to_cny.get(currency, 1.0)
+            amount_native = amount_cny / rate
+            print(f"  {account:16s} ¥{amount_cny:>12,.0f}  ≈ {amount_native:>12,.2f} {currency}  ({w*100:5.2f}%)")
+        print(f"\n汇率基准: {latest_fx_date.date()}  ({', '.join(f'{c}={r:.4f}' for c, r in rate_to_cny.items() if c != 'CNY')})")
 
 
 if __name__ == "__main__":
