@@ -71,6 +71,62 @@ OKX (XAUT现货)  0.02%
 
 ⚠️ 大额资金走 Schwab 需注意个人年度 5 万美元购汇额度；超额部分可考虑天天基金 / 微众银行的对应 QDII 指数基金作为不占额度的替代通道。
 
+## 被动配置 + 主动策略（卫星仓）
+
+如果除了这套被动配置，还想拿一部分钱跑自己的量化策略（比如 Schwab/OKX 上的自动化交易接口），不要把它揉进被动配置的风险平价锚里——两者的收益特性不兼容，会污染锚层对波动率/相关性的估计。正确做法是把主动策略当独立的"卫星仓"，用 [scripts/satellite_allocation.py](scripts/satellite_allocation.py) 算它该占总资产多少。
+
+参数全部放在 [config/satellite.yaml](config/satellite.yaml)，不用在命令行里堆一堆 `--xxx`：
+
+```yaml
+accounts:
+  Schwab量化:
+    strategies:
+      - name: 示例策略A
+        stats_path: null   # 可指向别的项目产出的 json: {"annual_vol":.., "sharpe":.., "track_months":..}
+        vol: 0.15           # stats_path 缺失/文件不存在时用这几个手填值兜底
+        sr: 0.0
+        months: 0
+  OKX量化:
+    strategies:
+      - name: 示例策略B
+        vol: 0.30
+        sr: 0.0
+        months: 0
+```
+
+每个账户下可以放任意多个策略；`stats_path` 是留给你接其他项目回测/实盘结果的接口。
+
+```bash
+python scripts/satellite_allocation.py                # 只看比例
+python scripts/satellite_allocation.py --total 500000  # 换算成具体金额
+```
+
+决策链条按 Robert Carver 的风险预算哲学实现，核心是"没有证据前不给权重，权重跟着实盘记录慢慢挣出来"：
+
+1. **每个策略的夏普按实盘月数向"零 edge 先验"收缩**——刚上线、没有实盘记录的策略，夏普按 0 算，不管回测多好看；月数积累到 `confidence_months`（默认36个月）后才不再收缩。
+2. **同账户内多策略、账户之间，都按波动率倒数做等风险权重**——不按夏普高低分配，因为短样本的夏普差异统计上通常不显著。
+3. **主动策略整体的风险预算，从 `risk_floor`（默认5%）起步，随收缩后的组合夏普线性爬升到 `risk_cap_ceiling`（默认30%）**——`risk_cap_ceiling` 是满信心时的政策上限，不是起始值；数据不够时实际拿到的预算会远低于这个上限。
+4. **用双资产风险贡献方程**（被动配置 vs 主动策略整体，波动率+相关性）反推出资金层面该怎么分，而不是直接用风险预算比例当资金比例（两者只有在波动率相近时才近似相等）。
+
+输出跟 `current_allocation.py` 风格一致，被动部分展开成原来那棵账户树，主动部分展开成 账户 → 策略 两层：
+
+```
+被动配置  94.91%
+  Schwab  55.67%  ...
+  同花顺  32.47%  ...
+  ...
+
+主动策略  5.09%
+  Schwab量化  3.39%
+    └─ 示例策略A          3.39%  (占该账户 100.0%)
+  OKX量化  1.70%
+    └─ 示例策略B          1.70%  (占该账户 100.0%)
+
+Polymarket  — 暂不参与风险预算, 待对冲策略确定后再纳入
+```
+
+Polymarket 暂时没有策略，只是留了个位置——等它被明确用作对冲工具（对冲什么风险、怎么对冲）后再纳入风险预算计算，不要在没想清楚定位前强行分配仓位。
+
 ## 完整回测（历史表现验证）
 
 ```bash
@@ -106,7 +162,7 @@ python scripts/freeze_params.py
 ## 目录结构
 
 ```
-config/           策略参数(params.yaml) + 回测配置(backtest.yaml)
+config/           策略参数(params.yaml) + 回测配置(backtest.yaml) + 主动策略卫星仓配置(satellite.yaml)
 src/backtest/     引擎代码 — engine/ 锚层+倾斜层+执行层, data/ 数据管道, reporting/ 报表
 scripts/          命令行入口
 tests/            单测(含核心不变量测试)
