@@ -245,8 +245,14 @@ def run_backtest_v2(
     params: Params,
     bt_cfg: BacktestConfig,
     md: "MarketDataProvider",
+    execution_mode: str = "ntz",
 ) -> BacktestResult:
     """v2 回测循环: 锚层 → 倾斜层 → NTZ 执行层。
+
+    execution_mode:
+      "ntz"      — 月度不交易区: 新钱补欠配, 超配卖回带边缘 (默认)
+      "buy_only" — 只买不卖: 超配不卖出, 靠后续新钱稀释 (实盘工具的规则)
+      "annual"   — 平时只买不卖, 每年 12 月强制全量再平衡到精确目标
 
     每月步骤:
     1. mark-to-market
@@ -347,7 +353,9 @@ def run_backtest_v2(
         )
         weight_history.append(snap)
 
-        # Step 3: 执行 (不交易区)
+        # Step 3: 执行
+        allow_sells = execution_mode == "ntz"
+        force_rebalance = execution_mode == "annual" and asof.month == 12
         exec_rec = monthly_execute_ntz(
             asof=asof,
             targets=targets,
@@ -356,6 +364,8 @@ def run_backtest_v2(
             params=params,
             bt_cfg=bt_cfg,
             contribution_cny=contribution,
+            allow_sells=allow_sells,
+            force_rebalance=force_rebalance,
         )
         executions.append(exec_rec)
 

@@ -200,8 +200,13 @@ def monthly_execute_ntz(
     params: Params,
     bt_cfg: BacktestConfig,
     contribution_cny: float,
+    allow_sells: bool = True,
+    force_rebalance: bool = False,
 ) -> ExecutionRecord:
     """月度执行: 不交易区 (No-Trade Zone) + 新钱填补 + 超配卖回边缘。
+
+    allow_sells=False: 只买不卖 — 跳过超配卖出, 超配靠后续新钱稀释。
+    force_rebalance=True: 无视带宽, 全部腿买/卖到精确目标 (年度再平衡用)。
 
     步骤:
     1. 计算当前实际权重
@@ -236,15 +241,15 @@ def monthly_execute_ntz(
     total_cost = 0.0
     remaining_cash = available
 
-    # ── 第一步: 超配卖回边缘 (失控保护) ──
-    for leg, tgt_w in targets.items():
+    # ── 第一步: 超配卖出 (失控保护; force_rebalance 时卖到精确目标) ──
+    for leg, tgt_w in (targets.items() if allow_sells or force_rebalance else []):
         current_cny = portfolio.holdings.get(leg, 0.0)
         current_w = current_cny / T if T > 0 else 0.0
-        band = _compute_band(leg, bt_cfg, params)
+        band = 0.0 if force_rebalance else _compute_band(leg, bt_cfg, params)
 
         upper_edge = tgt_w + band
         if current_w > upper_edge:
-            # 超配: 卖回到带边缘 (不卖到正中)
+            # 超配: 卖回到带边缘 (force_rebalance: 卖到精确目标)
             sell_cny = (current_w - upper_edge) * T
             sleeve = LEG_SLEEVE.get(leg, "equity")
             currency = MARKET_CURRENCY.get(leg, "CNY")
@@ -267,7 +272,7 @@ def monthly_execute_ntz(
     for leg, tgt_w in targets.items():
         current_cny = portfolio.holdings.get(leg, 0.0)
         current_w = current_cny / T_now if T_now > 0 else 0.0
-        band = _compute_band(leg, bt_cfg, params)
+        band = 0.0 if force_rebalance else _compute_band(leg, bt_cfg, params)
 
         lower_edge = tgt_w - band
         if current_w < lower_edge:
