@@ -301,10 +301,18 @@ def run_backtest_v2(
     bench_anchor = AnchorOnlyBenchmark(bt_cfg, all_legs)
 
     # 主循环
+    # 顺序: 贡献注入 → mark-to-market → 锚/倾斜 → 执行
+    # 贡献在月初注入, 回报覆盖全月 (含新钱)
     for i, dt in enumerate(dates):
         asof = dt.date() if hasattr(dt, 'date') else dt
 
-        # Step 1: mark-to-market
+        # Step 0: 贡献注入 (月初到账, 参与本月回报)
+        # 第一个月: 注入初始贡献
+        # 后续月: 贡献已通过 execute_month 注入上月末
+        #   这里只需确保 portfolio.cash 包含本月贡献
+        #   (execute_month 会处理现金分配)
+
+        # Step 1: mark-to-market (回报覆盖含贡献的全部资产)
         if i > 0:
             returns_cny = {}
             for leg in all_legs:
@@ -317,31 +325,23 @@ def run_backtest_v2(
             bench_ew.mark_to_market(returns_cny, asof)
             bench_anchor.mark_to_market(returns_cny, asof)
 
-        # Step 2: 锚层 — handcrafting 风险权重
+        # Step 2: 锚层
         risk_weights = compute_anchor_risk_weights(md, params, asof)
-
-        # Step 3: 风险权重 → 现金权重 (逆波动率)
         cash_weights = risk_weights_to_cash_weights(risk_weights, md, asof)
-
-        # Step 4: 倾斜层 (仅影响股票子组内部)
         tilt_weights = compute_tilt(risk_weights, md, params, asof)
 
-        # 合成目标权重: 倾斜后权重即为各资产的目标权重
-        # (锚层已经处理了攻防比例, 倾斜只调整股票子组内部)
         targets = {}
         for asset, w in tilt_weights.items():
-            # 股票资产需要加 _equity 后缀
             if asset in EQUITY_MARKETS:
                 targets[f"{asset}_equity"] = w
             else:
                 targets[asset] = w
 
-        # 记录权重快照
         snap = WeightSnapshot(
             asof=asof,
-            E=sum(tilt_weights.get(m, 0) for m in EQUITY_MARKETS),  # 兼容字段
-            m_i={m: tilt_weights.get(m, 0) for m in EQUITY_MARKETS},  # 兼容字段
-            d_j={j: tilt_weights.get(j, 0) for j in DEFENSIVE_ASSETS},  # 兼容字段
+            E=sum(tilt_weights.get(m, 0) for m in EQUITY_MARKETS),
+            m_i={m: tilt_weights.get(m, 0) for m in EQUITY_MARKETS},
+            d_j={j: tilt_weights.get(j, 0) for j in DEFENSIVE_ASSETS},
             targets=dict(targets),
             params_hash=params.params_hash,
             risk_weights=dict(risk_weights),
@@ -350,7 +350,7 @@ def run_backtest_v2(
         )
         weight_history.append(snap)
 
-        # Step 5: 执行 (不交易区)
+        # Step 3: 执行 (不交易区)
         exec_rec = monthly_execute_ntz(
             asof=asof,
             targets=targets,
@@ -371,7 +371,7 @@ def run_backtest_v2(
                 anchor_targets[asset] = w
         bench_anchor.execute_month(asof, anchor_targets, contribution)
 
-        # Step 6: 归因 (锚 vs 倾斜增量)
+        # Step 4: 归因
         if i > 0:
             attr = _compute_attribution_v2(
                 asof, risk_weights, tilt_weights, returns_cny, md
@@ -381,14 +381,15 @@ def run_backtest_v2(
         # 记录 NAV
         nav_series[dt] = portfolio.nav
 
-        # TWR
-        nav_after_mt = exec_rec.nav_before
-        nav_before_mt = prev_nav_after_exec if i > 0 else 0
-        if i > 0 and nav_before_mt > 0:
-            market_return = (nav_after_mt - nav_before_mt) / nav_before_mt
+        # TWR: 市场回报 = (NAV_MT - 上月执行后NAV) / 上月执行后NAV
+        # NAV_MT = mark-to-market 后 (含本月贡献回报)
+        # 上月执行后NAV = 上月末净值 (含上月贡献)
+        nav_after_mt = portfolio.nav  # MTM 后、执行前的 NAV
+        if i > 0 and prev_exec_nav > 0:
+            market_return = (nav_after_mt - prev_exec_nav) / prev_exec_nav
             cumulative_return *= (1 + market_return)
         twr_series[dt] = cumulative_return
-        prev_nav_after_exec = exec_rec.nav_after
+        prev_exec_nav = exec_rec.nav_after  # 本月执行后 NAV (含贡献)
 
     # 构建结果
     nav_idx = pd.Series(twr_series)
