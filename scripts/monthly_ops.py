@@ -160,7 +160,7 @@ def main():
             print(f"  {leg}: 超出目标 {pp:.1f}pp")
         print()
     if in_band:
-        print(f"带内不动: {', '.join(in_band)}")
+        print(f"带内 (无需再平衡, 新钱按目标比例正常分配): {', '.join(in_band)}")
     print(f"\n汇率基准: {fx_date.date()}  "
           f"({', '.join(f'{c}={r:.4f}' for c, r in fx.items() if c != 'CNY')})")
 

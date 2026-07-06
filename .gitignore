@@ -37,3 +37,4 @@ Thumbs.db
 
 # 个人真实持仓 (敏感, 不提交; 模板见 config/holdings.example.yaml)
 config/holdings.yaml
+config/api_credentials.yaml

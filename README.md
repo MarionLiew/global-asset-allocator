@@ -127,6 +127,29 @@ Polymarket  — 暂不参与风险预算, 待对冲策略确定后再纳入
 
 Polymarket 暂时没有策略，只是留了个位置——等它被明确用作对冲工具（对冲什么风险、怎么对冲）后再纳入风险预算计算，不要在没想清楚定位前强行分配仓位。
 
+## 月度运营（只买不卖）
+
+首次建仓之后，日常用的是 [scripts/monthly_ops.py](scripts/monthly_ops.py)：
+
+```bash
+cp config/holdings.example.yaml config/holdings.yaml   # 首次: 建持仓文件
+# 每月: 打开各账户抄一遍当前市值填进 holdings.yaml (本币计), 然后
+python scripts/monthly_ops.py --new-money 10000        # 本月注入1万, 输出买入清单
+```
+
+规则与回测执行层同一套带宽逻辑：欠配且漂出不交易区的腿新钱优先补到带边缘，剩余按目标比例分配；超配的腿**只提示不卖出**，由后续新钱稀释——不产生卖出交易和税费。
+
+`holdings.yaml` 是真实持仓（敏感数据），已 gitignore 不会被提交。
+
+手填容易抄错数字，可以用 [scripts/verify_holdings.py](scripts/verify_holdings.py) 对 OKX / Schwab 的 API 做交叉校验（只需只读权限的 API Key，配置见 `config/api_credentials.example.yaml`，凭据文件同样 gitignore）：
+
+```bash
+cp config/api_credentials.example.yaml config/api_credentials.yaml   # 填入只读 API Key
+python scripts/verify_holdings.py    # 手填 vs API, 相差>2% 报不一致
+```
+
+同花顺/ZA 没有可用的个人 API，这两个账户的数字靠手填时自查。
+
 ## 完整回测（历史表现验证）
 
 ```bash
