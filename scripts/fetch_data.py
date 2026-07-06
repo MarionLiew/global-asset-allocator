@@ -59,7 +59,7 @@ def _ensure_deps():
 
 # ─── ETF 下载 ─────────────────────────────────────────────────────────────────
 
-# US/DM/HK 及防御资产 — yfinance 历史较完整
+# US/DM/HK 及防御资产 — yfinance 历史较完整, 每次刷新到最新
 YFINANCE_TICKERS = {
     "US":        "SPY",
     "DM":        "EFA",
@@ -70,7 +70,7 @@ YFINANCE_TICKERS = {
     "EM_BOND":   "EMB",
 }
 
-# CN/CN_GOVT — 用本地 CSV (沪深 ETF yfinance 历史从 2012/2017 起，已下载)
+# CN/CN_GOVT — 用本地 CSV (已通过 fetch_proxy_data.py 拼接长历史+近期数据, 不要在此覆盖)
 LOCAL_ETFS = ["CN", "CN_GOVT"]
 
 
@@ -92,9 +92,6 @@ def download_etfs(start: str = "1993-01-01", end: str = "2025-01-01") -> None:
 
     for asset_id, ticker in YFINANCE_TICKERS.items():
         out_file = out_dir / f"{asset_id}.csv"
-        if out_file.exists():
-            logger.info(f"  {asset_id}: 已存在 {out_file.name}, 跳过")
-            continue
 
         logger.info(f"  下载 {asset_id} ({ticker})...")
         try:
@@ -168,10 +165,6 @@ def download_fx(start: str = "1993-01-01", end: str = "2025-01-01") -> None:
     out_dir = RAW_DIR / "fx"
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / "fx_rates.csv"
-
-    if out_path.exists():
-        logger.info(f"  FX: 已存在, 跳过")
-        return
 
     pairs = {"USDCNY": "USDCNY=X", "HKDUSD": "HKDUSD=X"}
     frames = []
@@ -271,8 +264,9 @@ def main():
     parser = argparse.ArgumentParser(description="数据抓取 + 预处理")
     parser.add_argument("--skip-download", action="store_true", help="跳过下载，直接构建 processed/")
     parser.add_argument("--synthetic",     action="store_true", help="使用合成数据（无需网络）")
+    import datetime
     parser.add_argument("--start",  default="1993-01-01", help="数据起始日期")
-    parser.add_argument("--end",    default="2025-01-01", help="数据结束日期")
+    parser.add_argument("--end",    default=datetime.date.today().isoformat(), help="数据结束日期 (默认今天)")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(message)s")

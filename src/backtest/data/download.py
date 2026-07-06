@@ -199,12 +199,55 @@ def download_shiller_cape(save_dir: Path | None = None) -> pd.DataFrame:
                     f"可能读了错误列。请检查 Yale 数据文件的列结构。"
                 )
         result["market"] = "US"
+
+        # Yale 页面本身已停止更新 (最后数据点常年停在 2023-09), 用 multpl.com 补最新月份
+        extension = _download_cape_multpl(after=result["date"].max())
+        if not extension.empty:
+            result = pd.concat([result, extension], ignore_index=True)
+            result = result.drop_duplicates(subset=["date"]).sort_values("date").reset_index(drop=True)
+
         result.to_csv(save_dir / "shiller_cape.csv", index=False)
         logger.info(f"  Shiller CAPE: {len(result)} 月 ({result['date'].min().date()} ~ {result['date'].max().date()})")
         return result
 
     except Exception as e:
         logger.warning(f"  Shiller 下载失败: {e}")
+        return pd.DataFrame()
+
+
+def _download_cape_multpl(after: "pd.Timestamp") -> pd.DataFrame:
+    """从 multpl.com 补充 Yale 页面停更后的 CAPE 数据 (同一 Shiller CAPE 指标, 按月更新)。"""
+    import re
+    import requests
+
+    try:
+        resp = requests.get(
+            "https://www.multpl.com/shiller-pe/table/by-month",
+            timeout=30,
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
+        resp.raise_for_status()
+        rows = re.findall(
+            r"<tr[^>]*>\s*<td[^>]*>([^<]+)</td>\s*<td[^>]*>([^<]+)</td>", resp.text
+        )
+        records = []
+        for date_str, value_str in rows:
+            try:
+                d = pd.Timestamp(date_str.strip()) + pd.offsets.MonthEnd(0)
+                cleaned = re.sub(r"&#x[0-9a-fA-F]+;", "", value_str)
+                v = float(re.search(r"[\d.]+", cleaned).group())
+            except (ValueError, TypeError, AttributeError):
+                continue
+            if d > after:
+                records.append((d, v))
+        if not records:
+            return pd.DataFrame()
+        out = pd.DataFrame(records, columns=["date", "cape"])
+        out["market"] = "US"
+        logger.info(f"  multpl.com 补充: {len(out)} 月 ({out['date'].min().date()} ~ {out['date'].max().date()})")
+        return out
+    except Exception as e:
+        logger.warning(f"  multpl.com 补充失败: {e}")
         return pd.DataFrame()
 
 
