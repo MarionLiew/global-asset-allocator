@@ -59,7 +59,8 @@ def _ensure_deps():
 
 # ─── ETF 下载 ─────────────────────────────────────────────────────────────────
 
-# US/DM/HK 及防御资产 — yfinance 历史较完整, 每次刷新到最新
+# All configured assets are refreshed from daily prices. Existing proxy history
+# is retained for months before the primary instrument begins trading.
 YFINANCE_TICKERS = {
     "US":        "SPY",
     "DM":        "EFA",
@@ -68,10 +69,11 @@ YFINANCE_TICKERS = {
     "GOLD":      "GLD",
     "CORP_BOND": "LQD",
     "EM_BOND":   "EMB",
+    "CN":        "510300.SS",
+    "CN_GOVT":   "511260.SS",
 }
 
-# CN/CN_GOVT — 用本地 CSV (已通过 fetch_proxy_data.py 拼接长历史+近期数据, 不要在此覆盖)
-LOCAL_ETFS = ["CN", "CN_GOVT"]
+LOCAL_ETFS: list[str] = []
 
 
 def _set_yf_proxy():
@@ -82,9 +84,10 @@ def _set_yf_proxy():
 
 
 def download_etfs(start: str = "1993-01-01", end: str = "2025-01-01") -> None:
-    """下载 yfinance ETF，本地 CSV 跳过。"""
+    """Refresh primary instruments from daily prices, retaining proxy history."""
     import pandas as pd
     import yfinance as yf
+    from backtest.data.monthly import last_complete_month_end, monthly_returns_from_daily_close
     _set_yf_proxy()
 
     out_dir = RAW_DIR / "etf"
@@ -96,24 +99,41 @@ def download_etfs(start: str = "1993-01-01", end: str = "2025-01-01") -> None:
         logger.info(f"  下载 {asset_id} ({ticker})...")
         try:
             time.sleep(2)
-            df = yf.download(ticker, start=start, end=end, interval="1mo",
+            df = yf.download(ticker, start=start, end=end, interval="1d",
                              auto_adjust=True, progress=False)
             if df.empty:
                 logger.warning(f"    {ticker}: 无数据")
                 continue
 
             close = df["Close"].iloc[:, 0] if isinstance(df.columns, pd.MultiIndex) else df["Close"]
-            close = close.resample("ME").last().dropna()
-            ret = close.pct_change().dropna()
+            monthly = monthly_returns_from_daily_close(close)
+            out = monthly.reset_index(names="date")
+            out["asset_id"] = asset_id
 
-            out = pd.DataFrame({
-                "date":     ret.index,
-                "close":    close.iloc[1:].values,
-                "return_m": ret.values,
-                "asset_id": asset_id,
-            })
-            out.to_csv(out_file, index=False)
-            logger.info(f"    {asset_id}: {len(out)} 月 ({out['date'].min().date()} ~ {out['date'].max().date()})")
+            # Preserve the long proxy history already present in the combined
+            # file, then let refreshed primary-instrument observations win.
+            history = []
+            combined_path = out_dir / "all_etf_returns.csv"
+            if combined_path.exists():
+                prior = pd.read_csv(combined_path, parse_dates=["date"])
+                prior = prior[prior["asset_id"] == asset_id].copy()
+                if not prior.empty:
+                    history.append(prior[["date", "return_m", "asset_id"]])
+            if out_file.exists():
+                prior = pd.read_csv(out_file, parse_dates=["date"])
+                if "asset_id" not in prior:
+                    prior["asset_id"] = asset_id
+                history.append(prior[["date", "return_m", "asset_id"]])
+            history.append(out[["date", "return_m", "asset_id"]])
+            saved = pd.concat(history, ignore_index=True)
+            saved["date"] = saved["date"].dt.to_period("M").dt.to_timestamp("M")
+            saved = saved[saved["date"] <= last_complete_month_end()]
+            saved = saved.drop_duplicates("date", keep="last").sort_values("date")
+            saved.to_csv(out_file, index=False)
+            logger.info(
+                f"    {asset_id}: refreshed through {out['date'].max().date()}, "
+                f"stored {len(saved)} months from {saved['date'].min().date()}"
+            )
         except Exception as e:
             logger.warning(f"    {ticker}: 下载失败 — {e}")
 
@@ -142,6 +162,8 @@ def build_all_etf_returns() -> None:
 
     combined = pd.concat(frames, ignore_index=True)
     combined["date"] = pd.to_datetime(combined["date"]).dt.to_period("M").dt.to_timestamp("M")
+    from backtest.data.monthly import last_complete_month_end
+    combined = combined[combined["date"] <= last_complete_month_end()]
     combined = combined.sort_values(["asset_id", "date"]).reset_index(drop=True)
 
     out_path = out_dir / "all_etf_returns.csv"
@@ -160,6 +182,7 @@ def download_fx(start: str = "1993-01-01", end: str = "2025-01-01") -> None:
     """下载 USD/CNY 和 HKD/USD 汇率。"""
     import pandas as pd
     import yfinance as yf
+    from backtest.data.monthly import last_complete_month_end
     _set_yf_proxy()
 
     out_dir = RAW_DIR / "fx"
@@ -173,12 +196,12 @@ def download_fx(start: str = "1993-01-01", end: str = "2025-01-01") -> None:
         logger.info(f"  下载汇率 {name} ({ticker})...")
         try:
             time.sleep(2)
-            df = yf.download(ticker, start=start, end=end, interval="1mo", progress=False)
+            df = yf.download(ticker, start=start, end=end, interval="1d", progress=False)
             if df.empty:
                 logger.warning(f"    {name}: 无数据")
                 continue
             close = df["Close"].iloc[:, 0] if isinstance(df.columns, pd.MultiIndex) else df["Close"]
-            close = close.resample("ME").last().dropna()
+            close = close.resample("ME").last().dropna().loc[:last_complete_month_end()]
             frames.append(pd.DataFrame({"date": close.index, "pair": name, "rate": close.values}))
             logger.info(f"    {name}: {len(close)} 月")
         except Exception as e:
@@ -265,11 +288,18 @@ def sanity_check() -> None:
 
     - CAPE 最新值应落在 [10, 60] (multpl 网页抓取脆弱, 解析错位会产生离谱数字)
     - ETF 月度回报 |r| ≤ 50% (超过大概率是拆分/数据错位, 不是真实行情)
-    - 数据新鲜度: 各资产最新月距今不超过 3 个月 (超过则警告)
+    - 数据新鲜度: 各资产必须覆盖最新已结束月份
+    - 共同覆盖期内不得缺失任何资产月份
     """
     import datetime
 
     import pandas as pd
+    from backtest.data._constants import EQUITY_MARKETS, DEFENSIVE_ASSETS
+    from backtest.data.monthly import (
+        IncompleteReturnPanelError,
+        complete_return_dates,
+        last_complete_month_end,
+    )
 
     errors = []
 
@@ -285,12 +315,30 @@ def sanity_check() -> None:
                           for r in extreme.itertuples())
         errors.append(f"ETF 月度回报异常 (|r|>50%): {rows}")
 
-    today = pd.Timestamp(datetime.date.today())
+    expected_latest = last_complete_month_end()
     staleness = etf.groupby("asset_id")["date"].max()
     for asset, latest in staleness.items():
-        months_stale = (today.year - latest.year) * 12 + today.month - latest.month
-        if months_stale > 3:
-            logger.warning(f"  ⚠️ {asset} 数据最新到 {latest.date()}, 已滞后 {months_stale} 个月")
+        latest = pd.Timestamp(latest).to_period("M").to_timestamp("M")
+        if latest < expected_latest:
+            errors.append(
+                f"{asset} latest return is {latest.date()}, expected {expected_latest.date()}"
+            )
+        elif latest > expected_latest:
+            errors.append(
+                f"{asset} contains incomplete/future month {latest.date()}, "
+                f"latest allowed is {expected_latest.date()}"
+            )
+
+    assets = EQUITY_MARKETS + DEFENSIVE_ASSETS
+    try:
+        complete_return_dates(
+            etf,
+            assets,
+            etf.groupby("asset_id")["date"].min().max(),
+            expected_latest,
+        )
+    except IncompleteReturnPanelError as exc:
+        errors.append(str(exc))
 
     if errors:
         for e in errors:

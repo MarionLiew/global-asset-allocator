@@ -18,6 +18,7 @@ from ..engine.ewma import mixed_ewma_vol
 from ._constants import (
     EQUITY_MARKETS, DEFENSIVE_ASSETS, MOMENTUM_LOOKBACK, MOMENTUM_SKIP,
 )
+from .monthly import MissingReturnError, complete_return_dates
 
 logger = logging.getLogger(__name__)
 
@@ -237,18 +238,18 @@ class CSVProvider:
         if asset in self._vol_cache:
             series = self._vol_cache[asset]
             subset = series[series.index <= pd.Timestamp(asof)]
-            if not subset.empty:
+            if not subset.empty and pd.notna(subset.iloc[-1]):
                 return float(subset.iloc[-1])
         return 0.15  # 15% 默认
 
     def monthly_return(self, asset: str, asof: date) -> float:
         """某资产 asof 月的总回报 (本币)。"""
         if self._return_idx.empty:
-            return 0.0
+            raise MissingReturnError("ETF return data is empty")
         key = (asset, pd.Timestamp(asof))
         if key in self._return_idx.index:
             return float(self._return_idx.loc[key, "return_m"])
-        return 0.0
+        raise MissingReturnError(f"Missing monthly return: {asset}@{pd.Timestamp(asof).date()}")
 
     def monthly_return_cny(self, asset: str, asof: date) -> float:
         """某资产 asof 月的总回报 (折 CNY)。
@@ -344,3 +345,14 @@ class CSVProvider:
             return []
         dates = sorted(self._etf_returns["date"].unique())
         return dates
+
+    def get_complete_return_dates(
+        self,
+        assets: list[str],
+        start: date | pd.Timestamp,
+        end: date | pd.Timestamp,
+    ) -> list[pd.Timestamp]:
+        """Return the continuous common window for all configured assets."""
+        if self._etf_returns.empty:
+            return []
+        return list(complete_return_dates(self._etf_returns, assets, start, end))

@@ -1,15 +1,30 @@
-# 主动策略风险预算 — 政策参数 (不常变, 改这里不用敲命令行参数)
-active_corr: 0.5          # 主动策略整体 vs 被动配置 的相关性假设 (用危机期数字, 偏保守)
-intra_active_corr: 0.5    # 同账户内/账户间多个策略彼此的相关性假设
-confidence_months: 36     # 需要多少个月实盘记录才算"满信心" (Carver: 通常要几年)
-full_confidence_sr: 1.0   # 满信心时, 收缩后夏普达到多少才给满风险预算上限
-# risk_floor 是"试验仓位"的定位: 小到亏光不影响大局、大到够积累实盘样本。
-# 想要更多主动仓位, 正确路径是积累实盘月数让收缩后夏普爬升, 而不是抬这个下限 —
-# 抬下限等于给零验证的策略发额度, 架空整个 Carver 收缩机制。
-# 当前设 0: 主动策略只保留接口不投入。真有策略要上线试验时改回 0.05。
-risk_floor: 0.0           # 主动策略风险预算下限 (数据不足时的起步值)
-risk_cap_ceiling: 0.3     # 主动策略风险预算上限 (满信心时的政策上限)
-active_band: 0.05         # monthly_ops 里主动策略的不交易区带宽 (只管拨款节奏, 给得宽)
+# 主动风险预算是政策参数，不由回测收益或 Sharpe 自动决定。
+# 当前为 0，因此示例策略不会获得真实资金。接入并验证自己的策略收益后，
+# 可从 0.05 开始影子/小额运行，再按明确审批提升；建议硬上限不超过 0.30。
+active_risk_budget: 0.0
+active_capital_cap: 0.25
+active_band: 0.05         # 主动策略不交易区带宽；目标为零时自动收窄为零
+
+# 策略层风险估计。日频 EWMA 波动率与三日重叠相关性分开估计。
+risk_estimation:
+  vol_ewma_span: 35
+  vol_min_periods: 20
+  overlap_days: 3
+  correlation_ewma_span: 126
+  min_common_observations: 63
+  max_staleness_days: 5
+  correlation_shrinkage: 0.50
+  fallback_correlation: 0.50
+  eigenvalue_floor: 1.0e-6
+
+# 核心配置与主动组合在月频收益上估计相关性；样本不足时使用保守后备值。
+top_level_risk:
+  passive_vol_ewma_span_months: 12
+  correlation_ewma_span_months: 36
+  min_common_months: 24
+  correlation_shrinkage: 0.50
+  fallback_correlation: 0.50
+  correlation_floor: 0.20
 
 # ── 接口A: 手动执行账户 ──
 # 账户金额与角色额度听模型, 账户内买什么标的自己定 (实现自由, 不算主观判断)。
@@ -21,40 +36,48 @@ manual_execution:
 
 # ── 接口B: 账户 -> 主动策略列表 ──
 # 每个账户可以放多个策略。想在某账户主动择时/选股, 在这里加条目 —
-# 它会和其他量化策略一起走 Carver 收缩机制 (零实盘只能小仓位起步),
+# 它会和其他量化策略一起走分层风险预算；资金总预算必须由人明确批准，
 # 被动树里对应市场的腿保持不变 (锚的结构不因此破坏)。
-# 每个策略优先从 stats_path 指向的 json 读取 {annual_vol, sharpe, track_months}
-# (方便接你别的项目跑出来的回测/实盘结果); stats_path 缺失或文件不存在时,
-# 回退用下面手填的 vol/sr/months。
+# 生产用 returns_path 指向扣除费用、已折算为 CNY 的日收益 CSV/Parquet。
+# 必需列默认是 date 和 return，可用 date_column/return_column 覆盖。
+# 没有 returns_path 时仅以手填 vol + fallback_correlation 运行，并在诊断中告警。
 accounts:
   Schwab量化:
+    risk_budget: 1.0
     strategies:
       - name: 示例策略A
-        stats_path: null   # 例: ~/other-project/output/strategy_a_stats.json
-        vol: 0.15
-        sr: 0.0
-        months: 0
+        enabled: true
+        account_currency: USD
+        returns_path: null   # 例: ../other-project/output/daily_returns.csv
+        returns_currency: CNY
+        returns_net_of_costs: true
+        risk_budget: 1.0
+        allocation_confidence: 1.0
+        max_active_weight: 0.60
+        vol: 0.15            # 仅 returns_path=null 时使用
 
   OKX量化:
+    risk_budget: 1.0
     strategies:
       - name: 示例策略B
-        stats_path: null
+        enabled: true
+        account_currency: USD
+        returns_path: null
+        returns_currency: CNY
+        returns_net_of_costs: true
+        risk_budget: 1.0
+        allocation_confidence: 1.0
+        max_active_weight: 0.60
         vol: 0.30
-        sr: 0.0
-        months: 0
 
   # 同花顺手动:            # 想在A股主动选股/择时时取消注释
   #   strategies:
   #     - name: A股手动策略
-  #       stats_path: null
+  #       returns_path: null
   #       vol: 0.20
-  #       sr: 0.0
-  #       months: 0
 
   # ZA手动:               # 想在港股主动选股/择时时取消注释
   #   strategies:
   #     - name: 港股手动策略
-  #       stats_path: null
+  #       returns_path: null
   #       vol: 0.25
-  #       sr: 0.0
-  #       months: 0

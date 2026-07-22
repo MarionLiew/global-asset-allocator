@@ -38,11 +38,18 @@ def run_backtest(
 
     同时计算两个被动基准。
     """
-    # 获取所有可用月末日期
-    available = md.get_available_dates()
+    # 所有腿 ID / 数据键
+    all_legs = [f"{m}_equity" for m in EQUITY_MARKETS] + DEFENSIVE_ASSETS
+    data_assets = [leg.replace("_equity", "") for leg in all_legs]
+
+    # 获取连续的共同月末日期。CSVProvider 会拒绝共同窗口内的缺失收益。
     start = pd.Timestamp(bt_cfg.start_date)
     end = pd.Timestamp(bt_cfg.end_date)
-    dates = [d for d in available if start <= d <= end]
+    if hasattr(md, "get_complete_return_dates"):
+        dates = md.get_complete_return_dates(data_assets, start, end)
+    else:
+        available = md.get_available_dates()
+        dates = [d for d in available if start <= d <= end]
 
     if not dates:
         raise ValueError(f"无可用日期在 {bt_cfg.start_date} ~ {bt_cfg.end_date}")
@@ -52,9 +59,6 @@ def run_backtest(
     # 初始化
     portfolio = Portfolio()
     contribution = bt_cfg.monthly_contribution_cny
-
-    # 所有腿 ID
-    all_legs = [f"{m}_equity" for m in EQUITY_MARKETS] + DEFENSIVE_ASSETS
 
     # 结果收集
     nav_series = {}
@@ -262,11 +266,18 @@ def run_backtest_v2(
     5. 执行: monthly_execute_ntz (不交易区 + 新钱填补)
     6. 记录: weights, attribution, costs
     """
-    # 获取所有可用月末日期
-    available = md.get_available_dates()
+    # 所有腿 ID / 数据键
+    all_legs = [f"{m}_equity" for m in EQUITY_MARKETS] + DEFENSIVE_ASSETS
+    data_assets = [leg.replace("_equity", "") for leg in all_legs]
+
+    # 获取连续的共同月末日期。CSVProvider 会拒绝共同窗口内的缺失收益。
     start = pd.Timestamp(bt_cfg.start_date)
     end = pd.Timestamp(bt_cfg.end_date)
-    dates = [d for d in available if start <= d <= end]
+    if hasattr(md, "get_complete_return_dates"):
+        dates = md.get_complete_return_dates(data_assets, start, end)
+    else:
+        available = md.get_available_dates()
+        dates = [d for d in available if start <= d <= end]
 
     if not dates:
         raise ValueError(f"无可用日期在 {bt_cfg.start_date} ~ {bt_cfg.end_date}")
@@ -276,9 +287,6 @@ def run_backtest_v2(
     # 初始化
     portfolio = Portfolio()
     contribution = bt_cfg.monthly_contribution_cny
-
-    # 所有腿 ID
-    all_legs = [f"{m}_equity" for m in EQUITY_MARKETS] + DEFENSIVE_ASSETS
 
     # 结果收集
     nav_series = {}

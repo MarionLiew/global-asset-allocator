@@ -75,38 +75,37 @@ OKX (XAUT现货)  0.02%
 
 如果除了这套被动配置，还想拿一部分钱跑自己的量化策略（比如 Schwab/OKX 上的自动化交易接口），不要把它揉进被动配置的风险平价锚里——两者的收益特性不兼容，会污染锚层对波动率/相关性的估计。正确做法是把主动策略当独立的"卫星仓"，用 [scripts/satellite_allocation.py](scripts/satellite_allocation.py) 算它该占总资产多少。
 
-参数全部放在 [config/satellite.yaml](config/satellite.yaml)，不用在命令行里堆一堆 `--xxx`：
+参数全部放在 [config/satellite.yaml](config/satellite.yaml)。每个策略的生产接口是一条日收益序列，必须已经扣除佣金、滑点和融资成本，并按当日汇率折算为人民币：
 
 ```yaml
 accounts:
   Schwab量化:
+    risk_budget: 1.0
     strategies:
       - name: 示例策略A
-        stats_path: null   # 可指向别的项目产出的 json: {"annual_vol":.., "sharpe":.., "track_months":..}
-        vol: 0.15           # stats_path 缺失/文件不存在时用这几个手填值兜底
-        sr: 0.0
-        months: 0
-  OKX量化:
-    strategies:
-      - name: 示例策略B
-        vol: 0.30
-        sr: 0.0
-        months: 0
+        returns_path: ../my-strategy/output/daily_returns.csv
+        returns_currency: CNY
+        returns_net_of_costs: true
+        risk_budget: 1.0
+        allocation_confidence: 1.0
+        max_active_weight: 0.60
 ```
 
-每个账户下可以放任意多个策略；`stats_path` 是留给你接其他项目回测/实盘结果的接口。
+CSV 默认需要 `date,return` 两列，其中 `return` 是小数简单收益（例如 1% 写成 `0.01`）。系统会拒绝重复日期、未来数据、过期数据、非人民币或未扣费收益。`returns_path` 为空时可以用手填 `vol` 作应急后备，但相关性会采用保守值并明确告警，不建议据此投入大额资金。
 
 ```bash
 python scripts/satellite_allocation.py                # 只看比例
 python scripts/satellite_allocation.py --total 500000  # 换算成具体金额
+python scripts/satellite_allocation.py --verbose --output output/active_allocation.json
 ```
 
-决策链条按 Robert Carver 的风险预算哲学实现，核心是"没有证据前不给权重，权重跟着实盘记录慢慢挣出来"：
+决策链条采用分层风险预算，参数不根据回测收益或 Sharpe 选择：
 
-1. **每个策略的夏普按实盘月数向"零 edge 先验"收缩**——刚上线、没有实盘记录的策略，夏普按 0 算，不管回测多好看；月数积累到 `confidence_months`（默认36个月）后才不再收缩。
-2. **同账户内多策略、账户之间，都按波动率倒数做等风险权重**——不按夏普高低分配，因为短样本的夏普差异统计上通常不显著。
-3. **主动策略整体的风险预算，从 `risk_floor`（默认5%）起步，随收缩后的组合夏普线性爬升到 `risk_cap_ceiling`（默认30%）**——`risk_cap_ceiling` 是满信心时的政策上限，不是起始值；数据不够时实际拿到的预算会远低于这个上限。
-4. **用双资产风险贡献方程**（被动配置 vs 主动策略整体，波动率+相关性）反推出资金层面该怎么分，而不是直接用风险预算比例当资金比例（两者只有在波动率相近时才近似相等）。
+1. 日频 EWMA（默认 span 35）估计每个策略波动率；同账户内、账户之间按显式风险预算和波动率组合。
+2. 三日重叠收益缓和不同市场收盘时点问题；相关矩阵使用日频 span 126、固定收缩和 PSD 修复，并输出重叠调整后的有效样本数。
+3. 被动与主动的相关性在月频净值上估计并收缩；历史不足时使用保守后备相关性。
+4. `active_risk_budget` 是人工批准的政策参数，再通过双资产 Euler 风险贡献方程反推主动资金权重，并受 `active_capital_cap` 硬约束。
+5. 默认 `active_risk_budget: 0.0`，所以仓库中的示例策略不会获得真实资金。接入真实收益、通过诊断后，才应显式提高预算。
 
 输出跟 `current_allocation.py` 风格一致，被动部分展开成原来那棵账户树，主动部分展开成 账户 → 策略 两层：
 
@@ -127,17 +126,18 @@ Polymarket  — 暂不参与风险预算, 待对冲策略确定后再纳入
 
 Polymarket 暂时没有策略，只是留了个位置——等它被明确用作对冲工具（对冲什么风险、怎么对冲）后再纳入风险预算计算，不要在没想清楚定位前强行分配仓位。
 
-## 月度运营（只买不卖）
+## 月度运营（动态缓冲再平衡）
 
 首次建仓之后，日常用的是 [scripts/monthly_ops.py](scripts/monthly_ops.py)：
 
 ```bash
 cp config/holdings.example.yaml config/holdings.yaml   # 首次: 建持仓文件
 # 每月: 打开各账户抄一遍当前市值填进 holdings.yaml (本币计), 然后
-python scripts/monthly_ops.py --new-money 10000        # 本月注入1万, 输出买入清单
+python scripts/monthly_ops.py --new-money 10000        # 默认动态模式，输出买卖清单
+python scripts/monthly_ops.py --new-money 10000 --mode buy-only  # 仅积累期使用
 ```
 
-规则与回测执行层同一套带宽逻辑：欠配且漂出不交易区的腿新钱优先补到带边缘，剩余按目标比例分配；超配的腿**只提示不卖出**，由后续新钱稀释——不产生卖出交易和税费。
+默认规则与回测执行层一致：超配且越过不交易区上沿的腿卖回上沿，所得资金与新钱优先补足下沿，剩余资金继续向精确目标靠拢。带内不做无必要交易，目标为零的停用策略不保留缓冲仓位。`buy-only` 只作为资金积累期的可选模式。
 
 `holdings.yaml` 是真实持仓（敏感数据），已 gitignore 不会被提交。
 

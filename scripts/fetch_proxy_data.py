@@ -70,16 +70,14 @@ PROXY_LAYERS: dict[str, list[tuple[str, str]]] = {
 def _download_ticker(ticker: str, start: str, end: str) -> pd.Series:
     """返回月度回报 Series，index=月末日期。"""
     import yfinance as yf
+    from backtest.data.monthly import monthly_returns_from_daily_close
     time.sleep(1.5)
-    df = yf.download(ticker, start=start, end=end, interval="1mo",
+    df = yf.download(ticker, start=start, end=end, interval="1d",
                      auto_adjust=True, progress=False)
     if df.empty:
         return pd.Series(dtype=float)
     close = df["Close"].iloc[:, 0] if isinstance(df.columns, pd.MultiIndex) else df["Close"]
-    close = close.resample("ME").last().dropna()
-    ret = close.pct_change().dropna()
-    ret.index = ret.index.to_period("M").to_timestamp("M")
-    return ret
+    return monthly_returns_from_daily_close(close)["return_m"]
 
 
 # ─── 合成序列 ─────────────────────────────────────────────────────────────────

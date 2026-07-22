@@ -35,8 +35,8 @@ def refresh_data():
     subprocess.check_call([sys.executable, str(PROJECT_ROOT / "scripts" / "fetch_data.py")])
 
 
-def get_passive_snapshot(params_path="config/params.yaml", config_path="config/backtest.yaml"):
-    """跑一遍被动配置模型, 返回最新一期的目标权重快照 (WeightSnapshot)。"""
+def get_passive_result(params_path="config/params.yaml", config_path="config/backtest.yaml"):
+    """运行被动配置模型并返回完整结果，供组合层复用收益与最新权重。"""
     from backtest.config import Params, BacktestConfig
     from backtest.data.csv_provider import CSVProvider
     from backtest.engine.backtest_loop import run_backtest_v2
@@ -51,8 +51,12 @@ def get_passive_snapshot(params_path="config/params.yaml", config_path="config/b
     bt_cfg = dataclasses.replace(bt_cfg, end_date=latest_common.strftime("%Y-%m-%d"))
 
     md = CSVProvider(str(PROJECT_ROOT), params)
-    result = run_backtest_v2(params, bt_cfg, md)
-    return result.weight_history[-1]
+    return run_backtest_v2(params, bt_cfg, md)
+
+
+def get_passive_snapshot(params_path="config/params.yaml", config_path="config/backtest.yaml"):
+    """跑一遍被动配置模型, 返回最新一期的目标权重快照 (WeightSnapshot)。"""
+    return get_passive_result(params_path, config_path).weight_history[-1]
 
 
 def build_account_tree(targets: dict, asset_account: dict = ASSET_ACCOUNT) -> dict:

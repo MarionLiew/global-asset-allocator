@@ -3,16 +3,15 @@
 被动配置 + 主动策略 两层风险预算计算 (Carver 式决策链条)。
 
 策略/账户配置全部放在 config/satellite.yaml, 命令行只用来管总金额/是否刷新数据。
-每个策略优先从 stats_path 指向的 json 读取 {annual_vol, sharpe, track_months}
-(接你别的项目跑出来的回测/实盘结果), 缺失时回退用 yaml 里手填的 vol/sr/months。
+生产路径读取每个策略扣费后的 CNY 日收益，自动估计波动率与相关性；
+没有收益文件时仍可使用手填波动率和保守相关性作为兼容后备。
 
 决策链条:
-    1. 每个策略的夏普按实盘月数向"零 edge 先验"收缩 (数据越少越接近假设没有 edge)
-    2. 同账户内多个策略、以及账户之间, 都按波动率倒数做等风险权重组合
-       (Carver: 缺乏压倒性证据前默认等风险, 不按夏普差异分高低)
-    3. 主动策略整体的风险预算 = risk-floor 起步, 随组合后的收缩夏普线性爬升到 risk-cap-ceiling
-    4. 双资产风险贡献方程, 结合被动/主动波动率和相关性, 反推被动:主动的资金权重
-    5. 被动部分展开现有配置树, 主动部分展开到 账户 -> 策略 两层, 一起打印成树形结果
+    1. 校验策略收益的唯一性、完整性、时效、币种与成本口径
+    2. 日收益 EWMA 估计波动率；重叠三日收益估计相关性并收缩、PSD 修复
+    3. 账户内及账户间按 handcrafting 等风险层级组合，不按回测 Sharpe 配权
+    4. 固定政策风险预算通过双资产风险贡献方程转为主动资金权重
+    5. 被动和主动目标统一输出，交给月度 NTZ 执行
 
 用法:
     python scripts/satellite_allocation.py                 # 用 config/satellite.yaml 里的参数
@@ -32,96 +31,51 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from current_allocation import (  # noqa: E402
     ASSET_ACCOUNT,
-    get_passive_snapshot,
+    get_passive_result,
     latest_fx_rates,
     refresh_data,
 )
+from backtest.active_sleeve import (  # noqa: E402
+    StrategyDataError,
+    build_active_risk_model,
+    estimate_core_active_correlation,
+)
 
 
-def shrink_sharpe(observed_sr: float, track_months: int, confidence_months: int):
-    """把观测到的夏普比率, 按数据量向 0 (零 edge 先验) 收缩。返回 (收缩后夏普, 信心度)。"""
-    confidence = min(1.0, track_months / confidence_months) if confidence_months > 0 else 1.0
-    return confidence * observed_sr, confidence
-
-
-def resolve_strategy_stats(strategy_cfg: dict) -> dict:
-    """优先读 stats_path 指向的外部 json ({annual_vol, sharpe, track_months}), 缺失则用 yaml 手填值。"""
-    stats_path = strategy_cfg.get("stats_path")
-    vol, sr, months = strategy_cfg.get("vol"), strategy_cfg.get("sr", 0.0), strategy_cfg.get("months", 0)
-
-    if stats_path:
-        p = Path(stats_path).expanduser()
-        if p.exists():
-            with open(p) as f:
-                external = json.load(f)
-            vol = external.get("annual_vol", vol)
-            sr = external.get("sharpe", sr)
-            months = external.get("track_months", months)
-
-    if vol is None:
-        raise ValueError(f"策略 {strategy_cfg.get('name', '?')} 缺少波动率 (vol 或 stats_path.annual_vol)")
-
-    return {"vol": vol, "sr": sr, "months": months}
-
-
-def combine_pool(items: dict, intra_corr: float) -> dict:
+def build_active_sleeve(cfg: dict, base_dir: Path = PROJECT_ROOT, asof=None):
     """
-    items: {name: {"vol": .., "sr": .. (已经是要用于组合的有效夏普)}}
-    组内按波动率倒数做等风险权重, 假设两两相关性都是 intra_corr。
-    返回 {"vol": 组合波动率, "sr": 组合有效夏普, "weights": {name: 组内权重}}
+    构建主动层，并转换为旧展示接口需要的兼容结构。
     """
-    names = list(items.keys())
-    if len(names) == 1:
-        n = names[0]
-        return {"vol": items[n]["vol"], "sr": items[n]["sr"], "weights": {n: 1.0}}
-
-    inv_vol = {n: 1.0 / items[n]["vol"] for n in names}
-    total_inv_vol = sum(inv_vol.values())
-    weights = {n: inv_vol[n] / total_inv_vol for n in names}
-
-    var = 0.0
-    for a in names:
-        for b in names:
-            rho = 1.0 if a == b else intra_corr
-            var += weights[a] * weights[b] * items[a]["vol"] * items[b]["vol"] * rho
-    combined_vol = var ** 0.5
-
-    expected_return = sum(weights[n] * items[n]["sr"] * items[n]["vol"] for n in names)
-    combined_sr = expected_return / combined_vol if combined_vol > 0 else 0.0
-
-    return {"vol": combined_vol, "sr": combined_sr, "weights": weights}
-
-
-def build_active_sleeve(cfg: dict):
-    """
-    解析 config/satellite.yaml 的 accounts 结构:
-      account -> 策略们(先做叶子收缩+组合) -> 账户级 vol/sr
-      账户们 -> 组合 -> 整体主动策略 vol/sr
-    返回 (active_combined, account_level, per_strategy_detail)
-    """
-    confidence_months = cfg["confidence_months"]
-    intra_corr = cfg["intra_active_corr"]
-
-    account_level = {}
+    model = build_active_risk_model(cfg, base_dir=base_dir, asof=asof)
     detail = {}
-
-    for account_name, account_cfg in cfg["accounts"].items():
-        leaf_items = {}
-        detail[account_name] = {}
-        for strat_cfg in account_cfg["strategies"]:
-            raw = resolve_strategy_stats(strat_cfg)
-            sr_shrunk, confidence = shrink_sharpe(raw["sr"], raw["months"], confidence_months)
-            leaf_items[strat_cfg["name"]] = {"vol": raw["vol"], "sr": sr_shrunk}
-            detail[account_name][strat_cfg["name"]] = {
-                "raw": raw, "sr_shrunk": sr_shrunk, "confidence": confidence,
+    account_level = {}
+    for account, weights in model.account_strategy_weights.items():
+        detail[account] = {}
+        for name in weights:
+            item = model.strategies[name]
+            detail[account][name] = {
+                "vol": item.annual_vol,
+                "source": item.source,
+                "observations": item.observations,
+                "first_date": item.first_date,
+                "last_date": item.last_date,
+                "warnings": item.warnings,
             }
+        members = list(weights)
+        vector = [weights.get(n, 0.0) for n in model.covariance.index]
+        import numpy as np
+        vol = float(np.sqrt(np.asarray(vector) @ model.covariance.to_numpy() @ np.asarray(vector)))
+        account_level[account] = {"vol": vol, "weights": weights}
 
-        combined = combine_pool(leaf_items, intra_corr)
-        account_level[account_name] = combined
-
-    active_pool = {name: {"vol": info["vol"], "sr": info["sr"]} for name, info in account_level.items()}
-    active_combined = combine_pool(active_pool, intra_corr)
-
+    active_combined = {
+        "vol": model.annual_vol,
+        "weights": model.account_weights,
+        "strategy_weights": model.strategy_weights,
+        "daily_returns": model.daily_returns,
+        "monthly_returns": model.monthly_returns,
+        "correlation": model.correlation,
+        "diagnostics": model.diagnostics,
+    }
     return active_combined, account_level, detail
 
 
@@ -142,6 +96,11 @@ def risk_contribution_of_active(w_active: float, vol_passive: float, vol_active:
 def solve_active_weight(risk_budget_target: float, vol_passive: float, vol_active: float, corr: float) -> float:
     from scipy.optimize import brentq
 
+    if risk_budget_target <= 0:
+        return 0.0
+    if risk_budget_target >= 1:
+        return 1.0
+
     def f(w_active):
         return risk_contribution_of_active(w_active, vol_passive, vol_active, corr) - risk_budget_target
 
@@ -153,35 +112,59 @@ def solve_active_weight(risk_budget_target: float, vol_passive: float, vol_activ
     return brentq(f, lo, hi)
 
 
-def compute_active_split(cfg: dict, passive_vol: float):
+def compute_active_split(
+    cfg: dict,
+    passive_vol: float,
+    passive_returns=None,
+    base_dir: Path = PROJECT_ROOT,
+    asof=None,
+):
     """整条决策链一步到位: satellite.yaml 配置 + 被动波动率 → 被动/主动资金拆分。
 
     返回 (w_active, active_combined, account_level, detail, risk_budget_target)。
     """
-    active_combined, account_level, detail = build_active_sleeve(cfg)
-    risk_budget_target = cfg["risk_floor"] + max(
-        0.0, min(1.0, active_combined["sr"] / cfg["full_confidence_sr"])
-    ) * (cfg["risk_cap_ceiling"] - cfg["risk_floor"])
-    w_active = solve_active_weight(
-        risk_budget_target, passive_vol, active_combined["vol"], cfg["active_corr"]
+    active_combined, account_level, detail = build_active_sleeve(cfg, base_dir, asof)
+    risk_budget_target = float(cfg.get("active_risk_budget", cfg.get("risk_floor", 0.0)))
+    if not 0.0 <= risk_budget_target < 1.0:
+        raise StrategyDataError("active_risk_budget must be in [0, 1)")
+    top_cfg = cfg.get("top_level_risk", {})
+    active_corr, corr_diag = estimate_core_active_correlation(
+        passive_returns,
+        active_combined.get("monthly_returns"),
+        fallback=float(top_cfg.get("fallback_correlation", cfg.get("active_corr", 0.5))),
+        floor=float(top_cfg.get("correlation_floor", 0.0)),
+        span_months=int(top_cfg.get("correlation_ewma_span_months", 36)),
+        min_months=int(top_cfg.get("min_common_months", 24)),
+        shrinkage=float(top_cfg.get("correlation_shrinkage", 0.50)),
     )
+    w_active = solve_active_weight(
+        risk_budget_target, passive_vol, active_combined["vol"], active_corr
+    )
+    w_active = min(w_active, float(cfg.get("active_capital_cap", 1.0)))
+    active_combined["core_active_correlation"] = active_corr
+    active_combined["core_active_correlation_diagnostics"] = corr_diag
+    active_combined["diagnostics"]["core_active_correlation"] = corr_diag
     return w_active, active_combined, account_level, detail, risk_budget_target
 
 
-def active_strategy_rows(w_active, active_combined, account_level):
+def active_strategy_rows(w_active, active_combined, account_level, include_zero=False):
     """展开主动层到 (策略key, 实体账户, 币种, 全局资金权重) 列表。
 
     策略名跨账户重名时加账户前缀保证 key 唯一。
     """
+    if w_active <= 0 and not include_zero:
+        return []
     rows = []
-    seen = set()
-    for account_name, w_in_active in active_combined["weights"].items():
+    for account_name in active_combined["weights"]:
         physical = PHYSICAL_ACCOUNT.get(account_name, account_name)
         currency = ACCOUNT_CURRENCY.get(physical, "CNY")
-        for strat, w_in_account in account_level[account_name]["weights"].items():
-            key = strat if strat not in seen else f"{account_name}:{strat}"
-            seen.add(key)
-            rows.append((key, physical, currency, w_active * w_in_active * w_in_account))
+        for strat in account_level[account_name]["weights"]:
+            rows.append((
+                strat,
+                physical,
+                currency,
+                w_active * active_combined["strategy_weights"][strat],
+            ))
     return rows
 
 
@@ -216,19 +199,24 @@ def print_decision_chain(detail, account_level, active_combined, cfg,
     for account_name, strategies in detail.items():
         print(f"  [{account_name}]")
         for strat_name, info in strategies.items():
-            raw = info["raw"]
-            print(f"    {strat_name}: vol={raw['vol']:.1%}, 回测夏普={raw['sr']:.2f}, "
-                  f"实盘{raw['months']}个月 → 信心={info['confidence']:.0%} → 收缩后夏普={info['sr_shrunk']:.2f}")
+            date_range = "manual"
+            if info["first_date"] is not None:
+                date_range = f"{info['first_date'].date()}..{info['last_date'].date()} ({info['observations']}日)"
+            print(f"    {strat_name}: vol={info['vol']:.1%}, source={info['source']}, {date_range}")
+            for warning in info["warnings"]:
+                print(f"      ⚠️ {warning}")
         acc = account_level[account_name]
-        print(f"    → 账户组合: vol={acc['vol']:.1%}, 有效夏普={acc['sr']:.2f}, "
+        print(f"    → 账户组合: vol={acc['vol']:.1%}, "
               f"内部权重={ {k: f'{v:.0%}' for k, v in acc['weights'].items()} }")
 
-    print(f"\n  主动策略整体: vol={active_combined['vol']:.1%}, 有效夏普={active_combined['sr']:.2f}, "
+    print(f"\n  主动策略整体: vol={active_combined['vol']:.1%}, "
           f"账户间权重={ {k: f'{v:.0%}' for k, v in active_combined['weights'].items()} }")
-    print(f"  → 风险预算 = {cfg['risk_floor']:.0%} + min(1, {active_combined['sr']:.2f}/{cfg['full_confidence_sr']:.2f}) × "
-          f"({cfg['risk_cap_ceiling']:.0%} - {cfg['risk_floor']:.0%}) = {risk_budget_target:.1%}")
+    corr_meta = active_combined["diagnostics"]["correlation"]
+    print(f"  主动相关性模式={corr_meta.get('mode')}, "
+          f"重叠调整有效样本={corr_meta.get('overlap_adjusted_effective_observations', 'n/a')}")
+    print(f"  → 固定政策风险预算 = {risk_budget_target:.1%}")
     print(f"  被动波动率={passive_vol:.1%}, 主动波动率={active_combined['vol']:.1%}, "
-          f"假设相关性={cfg['active_corr']:.2f}")
+          f"使用相关性={active_combined['core_active_correlation']:.2f}")
     print(f"  → 解得 被动:主动 资金权重 = {w_passive:.1%} : {w_active:.1%}")
 
 
@@ -240,8 +228,9 @@ def main():
     parser.add_argument("--satellite-config", default="config/satellite.yaml", help="主动策略配置文件")
     parser.add_argument("--total", type=float, default=None, help="总资金 (人民币)。不指定则只输出比例")
     parser.add_argument("--passive-vol", type=float, default=None,
-                         help="被动配置目标波动率, 默认读 params.yaml 的 target_vol")
+                         help="覆盖被动组合年化波动率；默认从被动净值估计")
     parser.add_argument("--verbose", action="store_true", help="显示 Carver 决策链条推导过程")
+    parser.add_argument("--output", default=None, help="可选: 保存机器可读的配置结果 JSON")
     args = parser.parse_args()
 
     with open(args.satellite_config) as f:
@@ -250,15 +239,21 @@ def main():
     if args.refresh:
         refresh_data()
 
-    snap = get_passive_snapshot(args.params, args.config)
+    passive_result = get_passive_result(args.params, args.config)
+    snap = passive_result.weight_history[-1]
+    passive_returns = passive_result.strategy_nav.pct_change().dropna()
 
     passive_vol = args.passive_vol
     if passive_vol is None:
-        from backtest.config import Params
-        passive_vol = Params.load(args.params).target_vol
+        span = int(cfg.get("top_level_risk", {}).get("passive_vol_ewma_span_months", 12))
+        passive_vol = float(passive_returns.ewm(span=span, min_periods=12).std().iloc[-1] * (12 ** 0.5))
 
     w_active, active_combined, account_level, detail, risk_budget_target = compute_active_split(
-        cfg, passive_vol
+        cfg,
+        passive_vol,
+        passive_returns=passive_returns,
+        base_dir=PROJECT_ROOT,
+        asof=snap.asof,
     )
     w_passive = 1.0 - w_active
 
@@ -343,6 +338,25 @@ def main():
     else:
         print(f"汇率基准: {latest_fx_date.date()}  "
               f"({', '.join(f'{c}={r:.4f}' for c, r in fx_rate_to_cny.items() if c != 'CNY')})")
+
+    if args.output:
+        output = Path(args.output)
+        if not output.is_absolute():
+            output = PROJECT_ROOT / output
+        output.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "asof": str(snap.asof),
+            "passive_vol": passive_vol,
+            "active_vol": active_combined["vol"],
+            "active_risk_budget": risk_budget_target,
+            "passive_capital_weight": w_passive,
+            "active_capital_weight": w_active,
+            "core_active_correlation": active_combined["core_active_correlation"],
+            "strategy_weights_within_active": active_combined["strategy_weights"],
+            "diagnostics": active_combined["diagnostics"],
+        }
+        output.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+        print(f"机器可读结果: {output}")
 
 
 if __name__ == "__main__":
